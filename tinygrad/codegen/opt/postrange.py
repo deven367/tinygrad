@@ -1,12 +1,13 @@
 from __future__ import annotations
 import math, itertools
+from dataclasses import replace
 from typing import cast
 from tinygrad.uop.ops import Ops, UOp, KernelInfo, graph_rewrite, AxisType, ssimplify, remove_all_tags
 from tinygrad.uop.ops import axis_letters, axis_colors, axis_to_pos
 from tinygrad.device import Buffer
 from tinygrad.dtype import dtypes, Invalid
 from tinygrad.helpers import colored, getenv, DEBUG, NOOPT, argsort, round_up, prod, merge_dicts, get_single_element, flatten
-from tinygrad.helpers import ALLOW_TF32, count, Context
+from tinygrad.helpers import ALLOW_TF32, count, Context, diskcache_get, diskcache_put
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError, check
 from tinygrad.codegen.simplify import pm_flatten_range
 from tinygrad.renderer import Renderer
@@ -330,19 +331,32 @@ class Scheduler:
 def args_from_ast(ast:UOp, dname:str) -> tuple[list[Buffer], dict[str, int]]:
   glbls = sorted([x for x in ast.backward_slice if x.op is Ops.PARAM and x.arg.slot >= 0], key=lambda x: x.arg.slot)
   return [Buffer(dname, x.max_numel(), x.dtype) for x in glbls], {k.expr:int(k.vmax+k.vmin)//2 for k in ast.variables()}
+def _beam_cache_key(ast:UOp, ren:Renderer) -> dict[str, bytes|str|bool]|None:
+  if ast.arg is None or ast.arg.opts_to_apply is not None: return None
+  info = replace(ast.arg, applied_opts=(), beam=0)
+  normalized = ast.replace(arg=info)
+  return {"ast": normalized.key, "target": repr(ren.target),
+          "estimate": bool(getenv("BEAM_ESTIMATE", 1)), "tf32": bool(ALLOW_TF32)}
+
 
 def apply_opts(ast:UOp, ren:Renderer, beam:int=0) -> UOp:
   if ast.tag is not None: return ast
   k = Scheduler(ast, ren)
   k.convert_loop_to_global()
+  cache_key = _beam_cache_key(ast, ren) if getenv("BEAM_CACHE", 0) else None
+  cached_opts = diskcache_get("beam_opts", cache_key) if cache_key is not None else None
   if ast.arg is not None and ast.arg.opts_to_apply is not None:
     for opt in ast.arg.opts_to_apply: k.apply_opt(opt)
+  elif cached_opts is not None:
+    for opt in cached_opts: k.apply_opt(opt)
+    if DEBUG >= 3: print(f"{ast.arg.function_name:<25} beam cache hit")
   elif beam >= 1:
     from tinygrad.codegen.opt.search import beam_search
     rawbufs, var_vals = args_from_ast(ast, ren.target.device)
     # beam search may open devices
     with Context(ALLOW_DEVICE_USAGE=1):
       k = beam_search(k, rawbufs, var_vals, beam, bool(getenv("BEAM_ESTIMATE", 1)))
+    if cache_key is not None: diskcache_put("beam_opts", cache_key, tuple(k.applied_opts))
   elif not NOOPT and (ast.arg is None or ast.arg.applied_opts == ()):
     from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
     # NOTE: hand_coded_optimizations doesn't support multiblock opts yet
