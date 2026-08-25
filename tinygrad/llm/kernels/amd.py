@@ -6,7 +6,7 @@ from tinygrad.device import Buffer
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
-
+from tinygrad.llm.kernels.nv import Q8_0, q8_0_linear, nv_custom_kernels_supported
 BLOCK_M, BLOCK_N, DECODE_HEAD_TILE, WARP_SIZE = 32, 32, 8, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
 WAVES_M, WAVES_N, LANES_PER_WAVE_M, LANES_PER_WAVE_N = 2, 2, 2, 16
@@ -54,21 +54,28 @@ class Linear(nn.Linear):
     self.in_features, self.out_features = in_features, out_features
   def set_quantized(self, decoded:Tensor):
     packed_sizes = {decoded.numel() // 256 * type_size:typ for typ,type_size in QUANT_SIZES.items()}
+    if nv_custom_kernels_supported(decoded.device): packed_sizes[decoded.numel() // 256 * 272] = Q8_0
     raw = next((u for u in decoded.uop.toposort() if u.op is Ops.SHRINK and u.dtype == dtypes.uint8 and prod(u.shape) in packed_sizes), None)
     if raw is None: return
     raw_offset = raw.contiguous_view_offset()
-    assert raw_offset is not None and raw_offset % 4 == 0 and raw.buf_uop.dtype == dtypes.uint8
     self.ggml_type = packed_sizes[prod(raw.shape)]
     # store a typed buffer view: a lazy BITCAST is decomposed into byte-combining ALU before custom-kernel
     # scheduling and would copy the entire packed weight on every JIT graph
-    packed_dtype = dtypes.uint8 if self.ggml_type == Q6_K else dtypes.uint32
+    packed_dtype = dtypes.uint8 if self.ggml_type == Q6_K else dtypes.uint16 if self.ggml_type == Q8_0 else dtypes.uint32
+    assert raw_offset is not None and raw_offset % packed_dtype.itemsize == 0 and raw.buf_uop.dtype == dtypes.uint8
     self.weight = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
       .view(raw.max_numel() * raw.dtype.itemsize // packed_dtype.itemsize, packed_dtype, raw_offset)))
   def __call__(self, x:Tensor) -> Tensor:
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
-    if self.ggml_type is None and supported:
+    nv_supported = self.use_custom_quant and nv_custom_kernels_supported(self.weight.device)
+    if self.ggml_type is None and (supported or nv_supported):
       self.set_quantized(self.weight)
-      if self.ggml_type is None: self.use_custom_quant = supported = False  # not a supported quant format
+      if self.ggml_type is None: self.use_custom_quant = supported = nv_supported = False  # not a supported quant format
+    if self.ggml_type == Q8_0 and nv_supported:
+      if isinstance(x.numel(), int): return q8_0_linear(self, x)
+      # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
+      out = q8_0_linear(self, x.pad_to(x.max_shape))
+      return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     if self.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS) and supported:
       if isinstance(x.numel(), int): return q8_linear(self, x)
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
