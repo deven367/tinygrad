@@ -27,6 +27,10 @@ def _nv_fmax(a:UOp, b:UOp) -> UOp:
   # __shfl_xor_sync returns garbage (observed alternating 0/32 across lanes).
   return UOp(Ops.CUSTOMI, dtypes.float32, (a, b), arg="fmaxf({0}, {1})")
 
+def _nv_ldcs16(ptr:UOp) -> UOp:
+  # aligned 2-byte streaming load: weights are read once per token, skip L2 allocation
+  return UOp(Ops.CUSTOMI, dtypes.uint16, (ptr,), arg="__ldcs((const unsigned short*){0})")
+
 
 def _warp_reduce(value:UOp, maximum:bool=False) -> UOp:
   for offset in (16, 8, 4, 2, 1):
@@ -92,9 +96,9 @@ def _q8_0_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_f
     base = (output*group_count+group)*Q8_U16_WORDS
     dot = UOp.const(0, dtypes.int32)
     for word_idx in range(8):
-      word = raw[base+1+word_idx*2].cast(dtypes.uint32) | (raw[base+2+word_idx*2].cast(dtypes.uint32) << 16)
+      word = _nv_ldcs16(raw[base+1+word_idx*2]) | (_nv_ldcs16(raw[base+2+word_idx*2]).cast(dtypes.uint32) << 16)
       dot = _nv_dp4a(word, xwords[word_idx], dot)
-    return dot.float() * xd[token, group, 0] * _half(raw[base])
+    return dot.float() * xd[token, group, 0] * _half(_nv_ldcs16(raw[base]))
   return _decode_linear(out, out_features, group_count, group_dot)
 
 
