@@ -73,7 +73,7 @@ def _q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]
   return q, scale
 
 
-def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot) -> UOp:
+def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str="nv_linear_q8_0") -> UOp:
   chunks = (group_count+31)//32
   token_output_chunk = UOp.range(out.shape[0]*out_features*chunks, 0, AxisType.GLOBAL)
   lane = UOp.range(32, 1, AxisType.LOCAL)
@@ -85,7 +85,7 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot) -> UOp
     (group < group_count).where(group_dot(token, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
   total = _warp_reduce(value)
   return out[token, output, chunk, lane].store(total.cast(out.dtype)).end(token_output_chunk, lane).sink(
-    arg=KernelInfo(name="nv_linear_q8_0", opts_to_apply=()))
+    arg=KernelInfo(name=name, opts_to_apply=()))
 
 
 @functools.cache
