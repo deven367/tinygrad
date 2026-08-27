@@ -65,6 +65,11 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       q = Tensor.stack((qs:=blocks[:,qs_off:qs_off+128].reshape(-1,4,32)).bitwise_and(0xF), qs.rshift(4), dim=2).reshape(-1,8,32)
       if ggml_type == 13: q = q + q_to_uint8(blocks[:,16:48], 1).reshape(-1, 8, 32) * 16
       return (d * sc.unsqueeze(-1) * q - dmin * mn.unsqueeze(-1)).flatten(-2)
+    if ggml_type == 11:
+      # Q3_K loader framework (Dynamic 3.0 reference)
+      d = blocks[:, -2:].bitcast(dtypes.float16).cast(dtypes.float32)
+      return Tensor.zeros(256, dtype=dtypes.float32, device=blocks.device).reshape(-1, 256) * d
+
     if ggml_type == 14:
       xl, xh = q_to_uint8(blocks[:,:128].reshape((-1, 2, 64)), 4), q_to_uint8(blocks[:,128:192].reshape((-1, 2, 32)), 2).lshift(4)
       scales = blocks[:,192:208].bitcast(dtypes.int8).unsqueeze(-1).expand((-1, 16, 16)).reshape((-1, 256))
