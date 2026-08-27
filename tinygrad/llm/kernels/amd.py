@@ -8,6 +8,7 @@ from tinygrad.helpers import prod
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.llm.kernels.nv import Q8_0, q8_0_linear, nv_custom_kernels_supported
 from tinygrad.llm.kernels.nv_q4k import q4_k_linear
+from tinygrad.llm.kernels.nv_q6k import q6_k_linear
 BLOCK_M, BLOCK_N, DECODE_HEAD_TILE, WARP_SIZE = 32, 32, 8, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
 WAVES_M, WAVES_N, LANES_PER_WAVE_M, LANES_PER_WAVE_N = 2, 2, 2, 16
@@ -57,16 +58,19 @@ class Linear(nn.Linear):
     # only claim packed formats this device can execute; others stay decoded for the generic path
     packed_sizes = {decoded.numel() // 256 * type_size:typ for typ,type_size in QUANT_SIZES.items()} \
       if amd_custom_kernels_supported(decoded.device) else {}
-    if nv_custom_kernels_supported(decoded.device):
+    nv_device = nv_custom_kernels_supported(decoded.device)
+    if nv_device:
       packed_sizes[decoded.numel() // 256 * 272] = Q8_0
       packed_sizes[decoded.numel() // 256 * Q4_WORDS * 4] = Q4_K
+      packed_sizes[decoded.numel() // 256 * Q6_BYTES] = Q6_K
     raw = next((u for u in decoded.uop.toposort() if u.op is Ops.SHRINK and u.dtype == dtypes.uint8 and prod(u.shape) in packed_sizes), None)
     if raw is None: return
     raw_offset = raw.contiguous_view_offset()
     self.ggml_type = packed_sizes[prod(raw.shape)]
     # store a typed buffer view: a lazy BITCAST is decomposed into byte-combining ALU before custom-kernel
     # scheduling and would copy the entire packed weight on every JIT graph
-    packed_dtype = dtypes.uint8 if self.ggml_type == Q6_K else dtypes.uint16 if self.ggml_type == Q8_0 else dtypes.uint32
+    packed_dtype = dtypes.uint16 if (self.ggml_type in (Q8_0, Q6_K) and nv_device) else \
+      dtypes.uint8 if self.ggml_type == Q6_K else dtypes.uint32
     assert raw_offset is not None and raw_offset % packed_dtype.itemsize == 0 and raw.buf_uop.dtype == dtypes.uint8
     self.weight = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
       .view(raw.max_numel() * raw.dtype.itemsize // packed_dtype.itemsize, packed_dtype, raw_offset)))
@@ -85,6 +89,11 @@ class Linear(nn.Linear):
       if isinstance(x.numel(), int): return q4_k_linear(self, x)
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q4_k_linear(self, x.pad_to(x.max_shape))
+      return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+    if self.ggml_type == Q6_K and nv_supported:
+      if isinstance(x.numel(), int): return q6_k_linear(self, x)
+      # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
+      out = q6_k_linear(self, x.pad_to(x.max_shape))
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     if self.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS) and supported:
       if isinstance(x.numel(), int): return q8_linear(self, x)
