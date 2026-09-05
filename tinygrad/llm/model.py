@@ -457,7 +457,30 @@ class Transformer:
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
     model = Transformer(config)
-    nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)
+    if (_tt := kv.get('tinygrad.tensor_types', {})):
+      from tinygrad.llm.kernels.amd import Linear as _AmdLinear
+      _NV_TYPES = (8, 12, 13, 14, 23)
+      seen: set[int] = set()
+      def _stamp(o, prefix):
+        if id(o) in seen: return
+        seen.add(id(o))
+        if isinstance(o, _AmdLinear): return
+        if isinstance(o, (list, tuple)):
+          for i, v in enumerate(o): _stamp(v, f'{prefix}.{i}')
+          return
+        if not hasattr(o, '__dict__'): return
+        for k, v in vars(o).items():
+          nm = f'{prefix}.{k}'
+          if isinstance(v, _AmdLinear):
+            wt = _tt.get(f'{nm}.weight')
+            if wt is not None:
+              v.ggml_type = wt
+              if wt in _NV_TYPES: v._needs_pack = True
+          elif not isinstance(v, (Tensor, int, float, str, type(None))): _stamp(v, nm)
+      _stamp(model.token_embd, 'token_embd')
+      _stamp(model.output, 'output')
+      for i, b in enumerate(model.blk): _stamp(b, f'blk.{i}')  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
@@ -476,8 +499,7 @@ class Transformer:
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
-    # P2: chunked prefill gate removed (was AMD-only: not amd_custom_kernels_supported -> chunk_size=1)
-    # chunk_size now preserved as parameter (default 32) for all devices
+    if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported

@@ -8,15 +8,16 @@ from tinygrad.helpers import prod
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.llm.kernels.nv import Q8_0, q8_0_linear, nv_custom_kernels_supported
 from tinygrad.llm.kernels.nv_q4k import q4_k_linear
+from tinygrad.llm.kernels.nv_q5k import q5_k_linear
 from tinygrad.llm.kernels.nv_q6k import q6_k_linear
+from tinygrad.llm.kernels.nv_iq4xs import iq4_xs_linear
 BLOCK_M, BLOCK_N, DECODE_HEAD_TILE, WARP_SIZE = 32, 32, 8, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
 WAVES_M, WAVES_N, LANES_PER_WAVE_M, LANES_PER_WAVE_N = 2, 2, 2, 16
 WMMA_ACC, THREADS_PER_BLOCK = WMMA_M // LANES_PER_WAVE_M, WARP_SIZE * WAVES_M * WAVES_N
 LDS_PAD, WMMA_ARG, LOG2E = 4, ((WMMA_M, WMMA_N, WMMA_K), 'AMD', 32), math.log2(math.e)
 Q4_K, Q5_K, Q6_K, IQ4_XS, GGML_BLOCK_SIZE, Q8_GROUP_SIZE, Q4_WORDS, Q5_WORDS, Q6_BYTES, IQ4_WORDS = 12, 13, 14, 23, 256, 32, 36, 44, 210, 34
-Q3_K, IQ4_NL, IQ3_S = 11, 20, 21
-QUANT_SIZES = {Q4_K: Q4_WORDS*4, Q5_K: Q5_WORDS*4, Q6_K: Q6_BYTES, IQ4_XS: IQ4_WORDS*4, Q3_K: 110, IQ4_NL: 18}  # bytes per 256-weight block
+QUANT_SIZES = {Q4_K: Q4_WORDS*4, Q5_K: Q5_WORDS*4, Q6_K: Q6_BYTES, IQ4_XS: IQ4_WORDS*4}  # bytes per 256-weight block
 
 def kernel_var(x:UOp) -> UOp:
   # a Variable is a 0-d ALU BUFFER in the tensor graph; inside kernels it takes the ALU PARAM form (same name keeps the value binding)
@@ -61,9 +62,10 @@ class Linear(nn.Linear):
       if amd_custom_kernels_supported(decoded.device) else {}
     nv_device = nv_custom_kernels_supported(decoded.device)
     if nv_device:
-      packed_sizes[decoded.numel() // 256 * 272] = Q8_0
-      packed_sizes[decoded.numel() // 256 * Q4_WORDS * 4] = Q4_K
-      packed_sizes[decoded.numel() // 256 * Q6_BYTES] = Q6_K
+      packed_blocks = {Q8_0: (272, 256), Q4_K: (Q4_WORDS*4, 256), Q5_K: (Q5_WORDS*4, 256),
+                       Q6_K: (Q6_BYTES, 256), IQ4_XS: (IQ4_WORDS*4, 256)}
+      for _typ, (_bytes, _elems) in packed_blocks.items():
+        packed_sizes[decoded.numel() // _elems * _bytes] = _typ
     raw = next((u for u in decoded.uop.toposort() if u.op is Ops.SHRINK and u.dtype == dtypes.uint8 and prod(u.shape) in packed_sizes), None)
     if raw is None: return
     raw_offset = raw.contiguous_view_offset()
@@ -78,7 +80,11 @@ class Linear(nn.Linear):
   def __call__(self, x:Tensor) -> Tensor:
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     nv_supported = self.use_custom_quant and nv_custom_kernels_supported(self.weight.device)
-    if self.ggml_type is None and (supported or nv_supported):
+    if getattr(self, '_needs_pack', False) and nv_supported:
+      self.set_quantized(self.weight)
+      self._needs_pack = False
+      if self.ggml_type is None: self.use_custom_quant = supported = nv_supported = False
+    elif self.ggml_type is None and (supported or nv_supported):
       self.set_quantized(self.weight)
       if self.ggml_type is None: self.use_custom_quant = supported = nv_supported = False  # not a supported quant format
     if self.ggml_type == Q8_0 and nv_supported:
@@ -91,10 +97,18 @@ class Linear(nn.Linear):
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q4_k_linear(self, x.pad_to(x.max_shape))
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+    if self.ggml_type == Q5_K and nv_supported:
+      if isinstance(x.numel(), int): return q5_k_linear(self, x)
+      out = q5_k_linear(self, x.pad_to(x.max_shape))
+      return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     if self.ggml_type == Q6_K and nv_supported:
       if isinstance(x.numel(), int): return q6_k_linear(self, x)
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q6_k_linear(self, x.pad_to(x.max_shape))
+      return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+    if self.ggml_type == IQ4_XS and nv_supported:
+      if isinstance(x.numel(), int): return iq4_xs_linear(self, x)
+      out = iq4_xs_linear(self, x.pad_to(x.max_shape))
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     if self.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS) and supported:
       if isinstance(x.numel(), int): return q8_linear(self, x)
