@@ -131,14 +131,12 @@ class Handler(HTTPRequestHandler):
       rendered = self.server.template.render(messages=body["messages"], tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True)
       ids: list[int] = self.server.tok.encode(rendered)
       stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  ")
-      if len(ids) >= self.server.model.max_context:
-        stderr_log(f"{colored('context length exceeded', 'red')}  in:{len(ids):5d}  max:{self.server.model.max_context:5d}\n")
-        return self.send_data(json.dumps({"error":{"message":f"prompt has {len(ids)} tokens, but the model context is "
+      max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
+      if len(ids) + (max_tokens or 1) > self.server.model.max_context:
+        stderr_log(f"{colored('context length exceeded', 'red')}  in:{len(ids):5d}  +{max_tokens or 1:5d}  max:{self.server.model.max_context:5d}\n")
+        return self.send_data(json.dumps({"error":{"message":f"prompt has {len(ids)} tokens + {max_tokens or 1} requested, but the model context is "
           f"{self.server.model.max_context}", "type":"invalid_request_error", "param":"messages", "code":"context_length_exceeded"}}).encode(),
           status_code=400)
-
-      # reply
-      max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
                               max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
                               reasoning=rendered.rstrip().endswith("<think>"))
