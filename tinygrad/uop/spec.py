@@ -272,7 +272,11 @@ spec_kernel_graph = PatternMatcher([
   # after on PARAM or AFTER
   (UPat(Ops.AFTER, src=(UPat(GroupOp.Movement.union({Ops.PARAM, Ops.AFTER, Ops.BUFFER, Ops.MSTACK, Ops.MSELECT, Ops.BITCAST, Ops.RESHAPE})),),
         allow_any_len=True, name="x"), lambda x: matches_dtype(x.src[0], x.dtype)),
-])
+  # REDUCE on ranges
+  (UPat(Ops.REDUCE, src=(UPat(),), allow_any_len=True, name="x"),
+   lambda x: isinstance(x.arg, tuple) and len(x.arg) == 2 and x.arg[0] in GroupOp.Reduce
+   and isinstance(x.arg[1], int) and all(y.dtype in (dtypes.weakint, dtypes.int) for y in x.src[1:])),
+])+spec_shared
 
 # **** pyrender (move this) ****
 

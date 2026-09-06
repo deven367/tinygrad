@@ -197,17 +197,22 @@ class TransformerBlock(FFNBlock):
 
     if self.config.cache_type == "q8_0":
       # ponytail: dequantizes full valid prefix per step; replace with tiled kernel if bandwidth-bound at long context
-      # ponytail: two-store breaks rangeify scheduler; int8 single-store works on CUDA
+      # single-store: values (int8) + compact scales (int8, scale*127) packed along last dim
+      # memory: 2*(D + D/32) bytes/value = 2.125 B/value vs FP16's 4 B/value
+      hd = self.config.head_dim
       kq, kd = _q8_0_quantize_kv(k)
       vq, vd = _q8_0_quantize_kv(v)
-      kd_full = kd.repeat_interleave(Q8_GROUP_SIZE, dim=-1)
-      vd_full = vd.repeat_interleave(Q8_GROUP_SIZE, dim=-1)
-      packed = Tensor.stack(kq.cast(dtypes.int8), vq.cast(dtypes.int8),
-                            (kd_full * 127).round().cast(dtypes.int8), (vd_full * 127).round().cast(dtypes.int8))
+      kd_i8 = (kd.cast(dtypes.float32) * 127).round().clamp(-127, 127).cast(dtypes.int8)
+      vd_i8 = (vd.cast(dtypes.float32) * 127).round().clamp(-127, 127).cast(dtypes.int8)
+      packed = Tensor.stack(kq.cast(dtypes.int8).cat(kd_i8, dim=-1), vq.cast(dtypes.int8).cat(vd_i8, dim=-1))
       store = self.cache_packed[:, :, :, start_pos:start_pos+T, :].uop.store(packed.uop)
       assigned = Tensor(self.cache_packed.uop.after(store))
-      k = (assigned[0, :, :, 0:start_pos+T, :].cast(dtypes.float32) * (assigned[2, :, :, 0:start_pos+T, :].cast(dtypes.float32) / 127.0)).cast(dtypes.half)
-      v = (assigned[1, :, :, 0:start_pos+T, :].cast(dtypes.float32) * (assigned[3, :, :, 0:start_pos+T, :].cast(dtypes.float32) / 127.0)).cast(dtypes.half)
+      k_vals = assigned[0, :, :, 0:start_pos+T, :hd]
+      k_scl = assigned[0, :, :, 0:start_pos+T, hd:]
+      v_vals = assigned[1, :, :, 0:start_pos+T, :hd]
+      v_scl = assigned[1, :, :, 0:start_pos+T, hd:]
+      k = (k_vals.cast(dtypes.float32) * k_scl.repeat_interleave(Q8_GROUP_SIZE, dim=-1).cast(dtypes.float32) / 127.0).cast(dtypes.half)
+      v = (v_vals.cast(dtypes.float32) * v_scl.repeat_interleave(Q8_GROUP_SIZE, dim=-1).cast(dtypes.float32) / 127.0).cast(dtypes.half)
     else:
       store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(dtypes.half).uop)
       assigned_kv = Tensor(self.cache_kv.uop.after(store))
@@ -229,7 +234,8 @@ class TransformerBlock(FFNBlock):
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_kv") and not hasattr(self, "cache_packed"):
       if self.config.cache_type == "q8_0":
-        self.cache_packed = Tensor.zeros(4, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim,
+        self.cache_packed = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context,
+                                         self.config.head_dim + self.config.head_dim // Q8_GROUP_SIZE,
                                          dtype=dtypes.int8, device=x.device)
       else:
         self.cache_kv = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim,
