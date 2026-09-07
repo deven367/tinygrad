@@ -17,7 +17,9 @@ class CUDAGraph(MultiGraphRunner):
     for (dev_idx, ast, bufs, device_vars), runtime in zip(self.calls, self.runtimes):
       if ast.op is Ops.PROGRAM:
         assert runtime is not None
-        global_size, local_size = ast.arg.launch_dims({v: 0 for v in self.vars})
+        global_size, local_size = ast.arg.launch_dims({v: 1 for v in self.vars})
+        global_size = tuple(max(1, x) for x in global_size)
+        if local_size: local_size = tuple(max(1, x) for x in local_size)
 
         c_deps, new_node = self.new_node([b.base for b in bufs], ast.arg.outs)
         c_args, vargs = encode_args([b._buf for b in bufs], [device_vars.get(x.expr, 0) for x in ast.arg.vars], runtime.signature)
