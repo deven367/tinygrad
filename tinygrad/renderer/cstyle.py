@@ -250,6 +250,11 @@ class CStyleLanguage(Renderer):
         kernel.append("\n".join("  "*depth + line for line in l.split("\n")))
         if prefix: c[prefix] += 1  # if it was used, increment
       if u.op in {Ops.IF, Ops.RANGE}: depth += 1
+    # ponytail: missing END uops for symbolic-bounded loops leave depth > 1; emit the
+    # outstanding closing braces so the generated source remains syntactically valid.
+    while depth > 1:
+      depth -= 1
+      kernel.append("  "*depth + "}")
     del self.r
 
     # NOTE: this relies on bufs dict preserving order
