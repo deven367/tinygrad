@@ -315,9 +315,7 @@ class GatedDeltaNetBlock(FFNBlock):
     initial = Tensor(start_pos).eq(0)
     is_kda = hasattr(self, "ssm_g_a")
     symbolic = isinstance(T, UOp)
-    # T_pad: loop bound is max_shape (chunk_size), actual tokens is x.shape[1] (bound value)
-    T_pad = x.max_shape[1]  # loop bound for symbolic chunks
-    T_actual = x.shape[1]  # actual tokens processed
+    T_pad = x.max_shape[1]  # symbolic chunks are padded to their max size: one graph serves every size
 
     # input processing
     x = x.half()
@@ -365,11 +363,10 @@ class GatedDeltaNetBlock(FFNBlock):
       state = initial.where(0, state.float())
       outs = []
       for t in range(T_pad):
-        # only process actual tokens; padded steps are no-ops (zero input)
-        s1 = state * alpha[:, :, t % T_actual]  # decay the state
-        delta = (v[:, :, t % T_actual] - (s1*k[:, :, t % T_actual]).sum(-1, keepdim=True)) * beta[:, :, t % T_actual]  # the delta rule update
-        state = s1 + delta * k[:, :, t % T_actual]
-        outs.append((state * q[:, :, t % T_actual]).sum(-1))
+        s1 = state * alpha[:, :, t]  # decay the state
+        delta = (v[:, :, t] - (s1*k[:, :, t]).sum(-1, keepdim=True)) * beta[:, :, t]  # the delta rule update
+        state = s1 + delta * k[:, :, t]
+        outs.append((state * q[:, :, t]).sum(-1))
 
       # store the updated recurrent state in place, then read the stacked outputs after the write
       state_store = self.recurrent_state.uop.store(state.cast(self.recurrent_state.dtype).uop)
