@@ -341,7 +341,7 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
 # ******** flash attention on the KV cache ********
 
 @functools.cache
-def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, max_kv_len, block_n):
+def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, max_kv_len, block_n, nv:bool=False):
   valid_kv_len = _unbind(valid_kv_len)
   _, B, H_KV, N, D = cast(tuple[int, int, int, int, int], cache_kv.shape)
   _, H, M, _ = cast(tuple[int, int, int, int], q.shape)
@@ -369,7 +369,7 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   updates:list[UOp] = []
   for head,q_head in enumerate(q_heads):
     scores = tuple(warp_reduce(sum((q[b, q_head, 0, d].float()*k for d,k in zip(dims, key_kvals)),
-                                   UOp.const(0, dtypes.float)), full_wave=True) / math.sqrt(D) for key_kvals in kvals)
+                                   UOp.const(0, dtypes.float)), full_wave=True, nv=nv) / math.sqrt(D) for key_kvals in kvals)
     prev_acc, prev_max, prev_sum = acc.after(offset)[head], row_max.after(offset)[head], row_sum.after(offset)[head]
     new_max = functools.reduce(lambda a,vs:a.maximum(vs[0].where(vs[1], UOp.const(-math.inf, dtypes.float))), zip(valid, scores), prev_max)
     alpha = ((prev_max-new_max)*LOG2E).exp2()
@@ -383,11 +383,13 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   return UOp.group(*stores).end(lane, wave, block_n, block_bhkv).sink(arg=KernelInfo(name="flash_decode_partial", opts_to_apply=()))
 
 def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, max_kv_len:int) -> Tensor:
+  from tinygrad.llm.kernels.nv import nv_custom_kernels_supported as _nv_supp
+  _nv = _nv_supp(q.device)
   B, H, D = cache_kv.shape[1], q.shape[1], cache_kv.shape[4]
   chunks = min(64, max_kv_len // 128)
   partial = Tensor.empty(B, H, chunks, D, dtype="float32", device=q.device)
   stats = Tensor.empty(B, H, chunks, 2, dtype="float32", device=q.device)
-  fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len, block_n=128)
+  fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len, block_n=128, nv=_nv)
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
   live = (valid_kv_len+127)//128
   live = min(live, chunks) if isinstance(live, int) else live.minimum(chunks)
