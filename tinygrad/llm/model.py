@@ -217,7 +217,7 @@ class TransformerBlock(FFNBlock):
     else:
       store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(dtypes.half).uop)
       assigned_kv = Tensor(self.cache_kv.uop.after(store))
-      if (amd_custom_kernels_supported(x.device) or nv_custom_kernels_supported(x.device)) and self.config.ssm is not None:
+      if (amd_custom_kernels_supported(x.device) or nv_custom_kernels_supported(x.device)) and self.config.ssm is not None and resolve(T == 1):
         attn = flash_attention(q, assigned_kv, start_pos+T)
         attn = attn.transpose(1, 2).reshape(B, T, -1)
         return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
