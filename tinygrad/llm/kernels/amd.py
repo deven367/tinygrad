@@ -36,12 +36,17 @@ def amd_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
   with Context(ALLOW_DEVICE_USAGE=1):
     return (t:=getattr(Device[device], "target", None)) is not None and t[0] == 11
 
-def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
+def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False, nv:bool=False) -> UOp:
   for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
     if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
-    other = UOp(Ops.CUSTOM, dtypes.float, (val,), arg=
-      f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | offset<<10}))")
-    val = val.maximum(other) if maximum else val + other
+    if nv:
+      other = UOp(Ops.CUSTOMI, val.dtype, (val,), arg=f"__shfl_xor_sync(0xffffffff, {{0}}, {offset}, 32)")
+      # ponytail: fmaxf via CUSTOMI — UOp.maximum lowers to ternary, double-evaluates __shfl_xor_sync → garbage
+      val = UOp(Ops.CUSTOMI, dtypes.float32, (val, other), arg="fmaxf({0}, {1})") if maximum else val + other
+    else:
+      other = UOp(Ops.CUSTOM, dtypes.float, (val,), arg=
+        f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | offset<<10}))")
+      val = val.maximum(other) if maximum else val + other
   return val
 
 def _reg(shape:tuple[int, ...], slot:int, value:float, dep:UOp|None=None) -> UOp:
@@ -490,7 +495,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
 # ******** gated delta net: fused recurrent scan ********
 
 @functools.cache
-def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None) -> UOp:
+def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None, nv:bool=False) -> UOp:
   batch, heads, tokens, value_dim, row_tile = *core.shape, 4
   key_dim, alpha_dim = q.shape[-1], alpha.shape[-1] if len(alpha.shape) == 4 else 1
   assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % 32 == 0 and value_dim % row_tile == 0
@@ -513,8 +518,8 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   for row_idx,row in enumerate(rows):
     previous = tuple(current.after(token)[row_idx*key_dim//32+i].load() for i in range(key_dim//32))
     av, bv = alpha[bh, token, row if alpha_dim > 1 else 0].load(), beta[bh, token].load()
-    state_k = warp_reduce(sum((x*y for x,y in zip(previous, keys)), UOp.const(0, dtypes.float32)), full_wave=True)
-    state_q = warp_reduce(sum((x*y for x,y in zip(previous, queries)), UOp.const(0, dtypes.float32)), full_wave=True)
+    state_k = warp_reduce(sum((x*y for x,y in zip(previous, keys)), UOp.const(0, dtypes.float32)), full_wave=True, nv=nv)
+    state_q = warp_reduce(sum((x*y for x,y in zip(previous, queries)), UOp.const(0, dtypes.float32)), full_wave=True, nv=nv)
     delta = (v[bh, token, row].load() - state_k*av) * bv
     updates += [x*av + delta*y for x,y in zip(previous, keys)]
     stores.append(core[bh, token, row.valid(lane.eq(0))].store(state_q*av + delta*kq[bh, token]))
@@ -524,6 +529,8 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   return UOp.group(*state_stores).end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
 
 def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None) -> Tensor:
+  from tinygrad.llm.kernels.nv import nv_custom_kernels_supported as _nv_supp
+  nv_device = _nv_supp(q.device)
   batch, heads, tokens, key_dim = q.shape
   value_dim = v.shape[-1]
   assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape == (batch, heads, value_dim, key_dim)
@@ -531,10 +538,15 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   assert key_dim % 32 == 0 and value_dim % 4 == 0
   core, kq = Tensor.empty_like(v), (q*k).sum(-1).contiguous()
   srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
-  if start_pos is None: return Tensor.custom_kernel(*srcs, fxn=_gated_delta_prefill_kernel)[0]
-  contig = tuple(x.uop if x.uop.op is Ops.AFTER else x.uop.contiguous() for x in srcs)
-  params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
-  assert start_pos.uop.is_bound_var
-  # the bound start_pos reaches the graph through the state AFTER chain, like the flash kernels' valid_end
-  call = _gated_delta_prefill_kernel(*params, kernel_var(start_pos.uop.src[0])).call(*contig)
-  return Tensor(contig[0].after(call))
+  if start_pos is None: return Tensor.custom_kernel(*srcs, fxn=functools.partial(_gated_delta_prefill_kernel, nv=nv_device))[0]
+  # resolve start_pos at capture time: the JIT captures separate graphs for prefill
+  # (start_pos=0, reset state) and rollout (start_pos>0, keep state). kernel_var
+  # binding doesn't propagate on CUDA, so we branch here instead.
+  from tinygrad.uop.ops import resolve
+  _, sp_val = start_pos.uop.unbind()
+  if resolve(sp_val == 0):
+    # prefill: always reset state (start_pos=0 → initial=True)
+    return Tensor.custom_kernel(*srcs, fxn=functools.partial(_gated_delta_prefill_kernel, start_pos=None, nv=nv_device))[0]
+  else:
+    # rollout: never reset (start_pos>0 → initial=False)
+    return Tensor.custom_kernel(*srcs, fxn=functools.partial(_gated_delta_prefill_kernel, start_pos=UOp.const(1, dtypes.int32), nv=nv_device))[0]

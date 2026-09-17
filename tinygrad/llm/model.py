@@ -3,6 +3,7 @@ import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -354,7 +355,7 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
     state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
-    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
+    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and (amd_custom_kernels_supported(x.device) or nv_custom_kernels_supported(x.device)):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3)
       core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
     else:
