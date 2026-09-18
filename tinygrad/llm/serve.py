@@ -87,7 +87,10 @@ class Handler(HTTPRequestHandler):
     completed = False
     try:
       yield chunk({"role":"assistant", "content":""})
-      for next_id in model.generate(ids, chunk_size=2, temperature=temperature):
+      # chunk_size=1: chunked prefill (cs>=2) diverges from token-by-token prefill -- the
+      # T-dependent embedding kernel differs by ~1e-4, and the first GatedDeltaNet block
+      # amplifies that to rel~2.6, silently changing the sampled tokens. cs=1 is exact.
+      for next_id in model.generate(ids, chunk_size=1, temperature=temperature):
         if len(out) == 0:
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
         if tok.is_end(next_id): break
