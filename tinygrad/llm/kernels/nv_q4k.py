@@ -67,12 +67,10 @@ def q4_k_linear(layer:Any, x:Tensor) -> Tensor:
   tokens = int(x.numel()) // layer.in_features
   raw, out_features, in_features = layer.weight.uop.buf_uop, layer.out_features, layer.in_features
   xq, xd = _q8_quantize(x, tokens, in_features)
-  chunks = (in_features // Q8_GROUP_SIZE + 31)//32
-  out = Tensor.empty(tokens, out_features, chunks, 32, dtype=dtypes.float32, device=x.device).uop
+  out = Tensor.empty(tokens, out_features, 32, dtype=dtypes.float32, device=x.device).uop
   all_srcs = (out, raw, xq.uop, xd.uop)
   params = tuple(UOp.placeholder_like(src, slot=i) for i,src in enumerate(all_srcs))
   kernel = _q4_k_decode_kernel(*params, out_features=out_features, in_features=in_features).call(*all_srcs)
   result = Tensor(out.after(kernel))[..., 0]
-  if chunks > 1: result = result.sum(-1)
   result = result.reshape(*x.shape[:-1], out_features)
   return result if layer.bias is None else result + layer.bias

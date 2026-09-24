@@ -79,16 +79,17 @@ def _q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str="nv_linear_q8_0") -> UOp:
   chunks = (group_count+31)//32
-  token_output_chunk = UOp.range(out.shape[0]*out_features*chunks, 0, AxisType.GLOBAL)
+  token_output = UOp.range(out.shape[0]*out_features, 0, AxisType.GLOBAL)
   lane = UOp.range(32, 1, AxisType.LOCAL)
-  token = token_output_chunk // (out_features*chunks)
-  output = (token_output_chunk//chunks) % out_features
-  chunk = token_output_chunk % chunks
-  group = lane+chunk*32
-  value = group_dot(token, output, group) if group_count % 32 == 0 else \
-    (group < group_count).where(group_dot(token, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
-  total = _warp_reduce(value)
-  return out[token, output, chunk, lane].store(total.cast(out.dtype)).end(token_output_chunk, lane).sink(
+  token = token_output // out_features
+  output = token_output % out_features
+  acc = UOp.const(0, dtypes.float32)
+  for chunk in range(chunks):
+    group = lane + chunk * 32
+    val = group_dot(token, output, group) if group_count % 32 == 0 else       (group < group_count).where(group_dot(token, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
+    acc = acc + val
+  total = _warp_reduce(acc)
+  return out[token, output, lane].store(total.cast(out.dtype)).end(token_output, lane).sink(
     arg=KernelInfo(name=name, opts_to_apply=()))
 
 
@@ -111,12 +112,10 @@ def q8_0_linear(layer:Any, x:Tensor) -> Tensor:
   tokens = int(x.numel()) // layer.in_features
   raw, out_features, in_features = layer.weight.uop.buf_uop, layer.out_features, layer.in_features
   xq, xd = _q8_quantize(x, tokens, in_features)
-  chunks = (in_features+1023)//1024
-  out = Tensor.empty(tokens, out_features, chunks, 32, dtype=dtypes.float32, device=x.device).uop
+  out = Tensor.empty(tokens, out_features, 32, dtype=dtypes.float32, device=x.device).uop
   all_srcs = (out, raw, xq.uop, xd.uop)
   params = tuple(UOp.placeholder_like(src, slot=i) for i,src in enumerate(all_srcs))
   kernel = _q8_0_decode_kernel(*params, out_features=out_features, in_features=in_features).call(*all_srcs)
   result = Tensor(out.after(kernel))[..., 0]
-  if chunks > 1: result = result.sum(-1)
   result = result.reshape(*x.shape[:-1], out_features)
   return result if layer.bias is None else result + layer.bias
