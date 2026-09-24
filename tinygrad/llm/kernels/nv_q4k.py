@@ -40,26 +40,62 @@ def _half(value:UOp) -> UOp: return value.cast(dtypes.uint16).bitcast(dtypes.flo
 
 @functools.cache
 def _q4_k_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_features:int) -> UOp:
-  group_count = in_features // Q8_GROUP_SIZE
-  def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
-    block, subgroup = group // 8, group % 8
-    xwords = _load_lanes(xq[token, group, 0], 8)
-    base = (output * in_features // GGML_BLOCK_SIZE + block) * Q4_WORDS
-    qs_base = base + 4 + (subgroup//2)*8
-    dot, qsum = UOp.const(0, dtypes.int32), UOp.const(0, dtypes.int32)
-    for word_idx in range(8):
-      word = (raw[qs_base+word_idx] >> ((subgroup & 1)*4).cast(dtypes.uint32)) & 0x0f0f0f0f
-      dot = _nv_dp4a(word, xwords[word_idx], dot)
-      qsum = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), xwords[word_idx], qsum)
-    scale = (subgroup < 4).where(_load_byte(raw, base, 4 + subgroup) & 63,
-      (_load_byte(raw, base, 8 + subgroup) & 15) | ((_load_byte(raw, base, subgroup) >> 6) << 4))
-    minimum = (subgroup < 4).where(_load_byte(raw, base, 8 + subgroup) & 63,
-      (_load_byte(raw, base, 8 + subgroup) >> 4) | ((_load_byte(raw, base, 4 + subgroup) >> 6) << 4))
+  num_blocks = in_features // GGML_BLOCK_SIZE
+  token_output = UOp.range(out.shape[0]*out_features, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, 1, AxisType.LOCAL)
+  token = token_output // out_features
+  output = token_output % out_features
+
+  pair = lane >> 3
+  w_idx = lane & 7
+  subgroup_even = pair * 2
+  subgroup_odd = pair * 2 + 1
+
+  acc = UOp.const(0, dtypes.float32)
+
+  for b in range(num_blocks):
+    base = (output * num_blocks + b) * Q4_WORDS
+    w = raw[base + 4 + lane]
+
+    grp_even = b * 8 + subgroup_even
+    grp_odd = b * 8 + subgroup_odd
+
+    x_even = xq[token, grp_even, w_idx].load()
+    x_odd  = xq[token, grp_odd,  w_idx].load()
+
+    w_even = w & 0x0f0f0f0f
+    w_odd  = (w >> 4) & 0x0f0f0f0f
+
+    dot_even = _nv_dp4a(w_even, x_even, UOp.const(0, dtypes.int32))
+    qsum_even = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x_even, UOp.const(0, dtypes.int32))
+
+    dot_odd = _nv_dp4a(w_odd, x_odd, UOp.const(0, dtypes.int32))
+    qsum_odd = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x_odd, UOp.const(0, dtypes.int32))
+
+    sc_even = (subgroup_even < 4).where(_load_byte(raw, base, 4 + subgroup_even) & 63,
+      (_load_byte(raw, base, 8 + subgroup_even) & 15) | ((_load_byte(raw, base, subgroup_even) >> 6) << 4))
+    m_even = (subgroup_even < 4).where(_load_byte(raw, base, 8 + subgroup_even) & 63,
+      (_load_byte(raw, base, 8 + subgroup_even) >> 4) | ((_load_byte(raw, base, 4 + subgroup_even) >> 6) << 4))
+
+    sc_odd = (subgroup_odd < 4).where(_load_byte(raw, base, 4 + subgroup_odd) & 63,
+      (_load_byte(raw, base, 8 + subgroup_odd) & 15) | ((_load_byte(raw, base, subgroup_odd) >> 6) << 4))
+    m_odd = (subgroup_odd < 4).where(_load_byte(raw, base, 8 + subgroup_odd) & 63,
+      (_load_byte(raw, base, 8 + subgroup_odd) >> 4) | ((_load_byte(raw, base, 4 + subgroup_odd) >> 6) << 4))
+
     d = _half(raw[base] & 0xffff)
     dmin = _half((raw[base] >> 16).cast(dtypes.uint32) & 0xffff)
-    return (dot.float()*d*scale.float() - qsum.float()*dmin*minimum.float()) * xd[token, group, 0]
-  from tinygrad.llm.kernels.nv import _decode_linear
-  return _decode_linear(out, out_features, group_count, group_dot, name="nv_linear_q4_k")
+
+    xd_even = xd[token, grp_even, 0]
+    xd_odd  = xd[token, grp_odd,  0]
+
+    val_even = (dot_even.float()*d*sc_even.float() - qsum_even.float()*dmin*m_even.float()) * xd_even
+    val_odd  = (dot_odd.float() *d*sc_odd.float()  - qsum_odd.float() *dmin*m_odd.float() ) * xd_odd
+
+    acc = acc + val_even + val_odd
+
+  total = _warp_reduce(acc)
+  return out[token, output, lane].store(total.cast(out.dtype)).end(token_output, lane).sink(
+    arg=KernelInfo(name="nv_linear_q4_k", opts_to_apply=()))
 
 
 def q4_k_linear(layer:Any, x:Tensor) -> Tensor:
