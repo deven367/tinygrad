@@ -178,10 +178,14 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, tokens:int, in_features:int) ->
   return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
 
 def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]:
+  if not hasattr(x, '_q8_cache'): x._q8_cache = {}
+  key = (tokens, in_features)
+  if key in x._q8_cache: return x._q8_cache[key]
   groups = in_features//Q8_GROUP_SIZE
   q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=x.device)
   scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)
   q, scale = Tensor.custom_kernel(q, scale, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))[:2]
+  x._q8_cache[key] = (q, scale)
   return q, scale
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:

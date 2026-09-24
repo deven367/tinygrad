@@ -66,10 +66,14 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, tokens:int, in_features:int) ->
 
 
 def _q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]:
+  if not hasattr(x, '_q8_cache'): x._q8_cache = {}
+  key = (tokens, in_features)
+  if key in x._q8_cache: return x._q8_cache[key]
   groups = in_features // Q8_GROUP_SIZE
   q = Tensor.empty(tokens, groups, 32, dtype=dtypes.uint32, device=x.device)
   scale = Tensor.empty(tokens, groups, 32, dtype=dtypes.float32, device=x.device)
   q, scale = Tensor.custom_kernel(q, scale, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))[:2]
+  x._q8_cache[key] = (q, scale)
   return q, scale
 
 
