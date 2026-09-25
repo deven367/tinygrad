@@ -36,6 +36,99 @@ def _u16_word(raw:UOp, idx:UOp) -> UOp:
 
 
 @functools.cache
+def _q6_k_v2_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_features:int) -> UOp:
+  num_blocks = in_features // GGML_BLOCK_SIZE
+  assert num_blocks % 2 == 0, f"num_blocks must be even, got {num_blocks}"
+  token_output = UOp.range(out.shape[0]*out_features, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, 1, AxisType.LOCAL)
+  token = token_output // out_features
+  output = token_output % out_features
+
+  lane16 = lane & 15
+  block_in_pair = lane >> 4
+
+  pair = lane16 >> 2
+  half = pair >> 1
+  quarter = pair & 1
+  k = lane16 & 3
+
+  s0 = (half << 2) + quarter
+  s1 = s0 + 2
+
+  w0 = k << 1
+  w1 = w0 + 1
+
+  acc = UOp.const(0, dtypes.float32)
+
+  for b_pair in range(num_blocks // 2):
+    b = b_pair * 2 + block_in_pair
+    base = (output * num_blocks + b) * Q6_WORDS
+
+    ql_idx = base + (half << 5) + (quarter << 4) + (k << 2)
+    w_ql0 = _u16_word(raw, ql_idx)
+    w_ql1 = _u16_word(raw, ql_idx + 2)
+
+    qh_idx = base + 64 + (half << 4) + (k << 2)
+    w_qh0 = _u16_word(raw, qh_idx)
+    w_qh1 = _u16_word(raw, qh_idx + 2)
+
+    sh0 = quarter << 1
+    sh1 = sh0 + 4
+
+    qh0_0 = (w_qh0 >> sh0.cast(dtypes.uint32)) & 0x03030303
+    qh1_0 = (w_qh0 >> sh1.cast(dtypes.uint32)) & 0x03030303
+    ql0_0 = w_ql0 & 0x0f0f0f0f
+    ql1_0 = (w_ql0 >> 4) & 0x0f0f0f0f
+    qword0_0 = ql0_0 | (qh0_0 << 4)
+    qword1_0 = ql1_0 | (qh1_0 << 4)
+
+    qh0_1 = (w_qh1 >> sh0.cast(dtypes.uint32)) & 0x03030303
+    qh1_1 = (w_qh1 >> sh1.cast(dtypes.uint32)) & 0x03030303
+    ql0_1 = w_ql1 & 0x0f0f0f0f
+    ql1_1 = (w_ql1 >> 4) & 0x0f0f0f0f
+    qword0_1 = ql0_1 | (qh0_1 << 4)
+    qword1_1 = ql1_1 | (qh1_1 << 4)
+
+    grp0 = b * 8 + s0
+    grp1 = b * 8 + s1
+
+    x0_0 = xq[token, grp0, w0].load()
+    x0_1 = xq[token, grp0, w1].load()
+    x1_0 = xq[token, grp1, w0].load()
+    x1_1 = xq[token, grp1, w1].load()
+
+    dot0 = _nv_dp4a(qword0_0, x0_0, UOp.const(0, dtypes.int32))
+    dot0 = _nv_dp4a(qword0_1, x0_1, dot0)
+    qsum0 = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x0_0, UOp.const(0, dtypes.int32))
+    qsum0 = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x0_1, qsum0)
+
+    dot1 = _nv_dp4a(qword1_0, x1_0, UOp.const(0, dtypes.int32))
+    dot1 = _nv_dp4a(qword1_1, x1_1, dot1)
+    qsum1 = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x1_0, UOp.const(0, dtypes.int32))
+    qsum1 = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x1_1, qsum1)
+
+    sw0 = raw[base + 96 + s0]
+    sw1 = raw[base + 96 + s1]
+
+    sc0 = (k < 2).where(sw0 & 255, sw0 >> 8).cast(dtypes.uint8).bitcast(dtypes.int8).float()
+    sc1 = (k < 2).where(sw1 & 255, sw1 >> 8).cast(dtypes.uint8).bitcast(dtypes.int8).float()
+
+    xd0 = xd[token, grp0, 0]
+    xd1 = xd[token, grp1, 0]
+
+    d = _half(raw[base + 104])
+
+    val0 = (dot0.float() - 32.0 * qsum0.float()) * sc0 * xd0
+    val1 = (dot1.float() - 32.0 * qsum1.float()) * sc1 * xd1
+
+    acc = acc + (val0 + val1) * d
+
+  total = _warp_reduce(acc)
+  return out[token, output, lane].store(total.cast(out.dtype)).end(token_output, lane).sink(
+    arg=KernelInfo(name="nv_linear_q6_k_v2", opts_to_apply=()))
+
+
+@functools.cache
 def _q6_k_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_features:int) -> UOp:
   num_blocks = in_features // GGML_BLOCK_SIZE
   token_output = UOp.range(out.shape[0]*out_features, 0, AxisType.GLOBAL)
@@ -119,7 +212,11 @@ def q6_k_linear(layer:Any, x:Tensor) -> Tensor:
   out = Tensor.empty(tokens, out_features, 32, dtype=dtypes.float32, device=x.device).uop
   all_srcs = (out, raw, xq.uop, xd.uop)
   params = tuple(UOp.placeholder_like(src, slot=i) for i, src in enumerate(all_srcs))
-  kernel = _q6_k_decode_kernel(*params, out_features=out_features, in_features=in_features).call(*all_srcs)
+  num_blocks = in_features // GGML_BLOCK_SIZE
+  if num_blocks % 2 == 0:
+    kernel = _q6_k_v2_decode_kernel(*params, out_features=out_features, in_features=in_features).call(*all_srcs)
+  else:
+    kernel = _q6_k_decode_kernel(*params, out_features=out_features, in_features=in_features).call(*all_srcs)
   result = Tensor(out.after(kernel))[..., 0]
   result = result.reshape(*x.shape[:-1], out_features)
   return result if layer.bias is None else result + layer.bias

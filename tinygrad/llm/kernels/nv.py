@@ -21,6 +21,10 @@ def _nv_shuffle_xor(value:UOp, offset:int) -> UOp:
   return UOp(Ops.CUSTOMI, value.dtype, (value,), arg=f"__shfl_xor_sync(0xffffffff, {{0}}, {offset}, 32)")
 
 
+def _nv_shuffle_idx(value:UOp, idx:UOp) -> UOp:
+  return UOp(Ops.CUSTOMI, value.dtype, (value, idx.cast(dtypes.int32)), arg="__shfl_sync(0xffffffff, {0}, {1}, 32)")
+
+
 def _nv_fmax(a:UOp, b:UOp) -> UOp:
   # NOTE: cannot use UOp.maximum: the CUDA renderer lowers it to a ternary
   # (a < shfl) ? shfl : a, evaluating the shuffle twice. Double-evaluated
@@ -56,11 +60,15 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, tokens:int, in_features:int) ->
   lane = UOp.range(32, 1, AxisType.LOCAL)
   token, group = token_group//groups, token_group%groups
   x = x.reshape(tokens, groups, Q8_GROUP_SIZE)
-  group_scale = (_warp_reduce(x[token, group, lane].float().abs(), maximum=True) / 127).maximum(1e-8)
+  v = x[token, group, lane].float()
+  group_scale = (_warp_reduce(v.abs(), maximum=True) / 127).maximum(1e-8)
+  q_val = (v / group_scale).round().clip(-127, 127).cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32)
   word_lane = lane.minimum(7)
-  xs = tuple(x[token, group, word_lane*4+i].float() for i in range(4))
-  word = sum(((v/group_scale).round().clip(-127, 127).cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32) << (i*8)
-              for i,v in enumerate(xs)), UOp.const(0, dtypes.uint32))
+  q0 = _nv_shuffle_idx(q_val, word_lane * 4)
+  q1 = _nv_shuffle_idx(q_val, word_lane * 4 + 1)
+  q2 = _nv_shuffle_idx(q_val, word_lane * 4 + 2)
+  q3 = _nv_shuffle_idx(q_val, word_lane * 4 + 3)
+  word = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24)
   stores = (q[token, group, lane].store(word), scale[token, group, lane].store(group_scale))
   return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="nv_q8_quantize", opts_to_apply=()))
 
@@ -154,3 +162,38 @@ def q8_0_linear(layer:Any, x:Tensor) -> Tensor:
   result = Tensor(out.after(kernel))[..., 0]
   result = result.reshape(*x.shape[:-1], out_features)
   return result if layer.bias is None else result + layer.bias
+
+
+@functools.cache
+def _l2norm_kernel(out:UOp, x:UOp, tokens:int, dim:int, eps:float) -> UOp:
+  token = UOp.range(tokens, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, 1, AxisType.LOCAL)
+  elems = dim // 32
+  acc = UOp.const(0, dtypes.float32)
+  for i in range(elems):
+    idx = lane + i * 32
+    v = x[token, idx].float()
+    acc = acc + v * v
+  total = _warp_reduce(acc)
+  # L2 norm: x / max(sqrt(sum(x²)), eps)  =>  x * (1 / max(sqrt(total), eps))
+  norm = total.sqrt().maximum(eps).reciprocal()
+  stores = []
+  for i in range(elems):
+    idx = lane + i * 32
+    v = x[token, idx].float()
+    stores.append(out[token, idx].store((v * norm).cast(out.dtype)))
+  return UOp.group(*stores).end(token, lane).sink(arg=KernelInfo(name="nv_normalize", opts_to_apply=()))
+
+
+def nv_normalize(x:Tensor, eps:float=1e-6) -> Tensor:
+  """Fused warp-level L2 normalization: x / max(||x||_2, eps)."""
+  D = x.shape[-1]
+  if not nv_custom_kernels_supported(x.device) or isinstance(D, UOp) or D % 32 != 0:
+    return x.normalize(dim=-1, eps=eps)
+  orig_shape = x.shape
+  x_flat = x.reshape(-1, D)
+  tokens = x_flat.shape[0]
+  out = Tensor.empty(tokens, D, dtype=x.dtype, device=x.device)
+  res = Tensor.custom_kernel(out, x_flat.contiguous(),
+                             fxn=functools.partial(_l2norm_kernel, tokens=tokens, dim=D, eps=eps))[0]
+  return res.reshape(orig_shape)

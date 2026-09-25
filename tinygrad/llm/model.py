@@ -3,7 +3,7 @@ import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_rmsnorm
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_rmsnorm, nv_normalize
 from tinygrad.llm.gguf import gguf_load
 
 class RMSNorm(nn.RMSNorm):
@@ -352,7 +352,7 @@ class GatedDeltaNetBlock(FFNBlock):
       beta, log_alpha = beta.pad_to((B, T_pad, self.num_v_heads)), log_alpha.pad_to((B, T_pad, *log_alpha.shape[2:]))
     q, k, v = conv_out.split([self.q_dim, self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
     qk_eps = 1e-12 if is_kda else 1e-6
-    q, k = (z.reshape(B, T_pad, self.num_k_heads, self.head_k_dim).normalize(dim=-1, eps=qk_eps)
+    q, k = (nv_normalize(z.reshape(B, T_pad, self.num_k_heads, self.head_k_dim), eps=qk_eps)
             .repeat(1, 1, self.num_v_heads//self.num_k_heads, 1) for z in (q, k))
     v = v.reshape(B, T_pad, self.num_v_heads, self.head_v_dim)
     # layout the per-step operands to broadcast against the (B, H, V, K) state
