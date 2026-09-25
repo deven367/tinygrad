@@ -3,8 +3,15 @@ import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_rmsnorm
 from tinygrad.llm.gguf import gguf_load
+
+class RMSNorm(nn.RMSNorm):
+  def __call__(self, x:Tensor) -> Tensor:
+    if nv_custom_kernels_supported(x.device) and self.weight is not None:
+      return nv_rmsnorm(x, self.weight, self.eps)
+    return super().__call__(x)
+
 from tinygrad.uop.ops import resolve
 
 class ExpertGating(enum.IntEnum):
@@ -88,8 +95,8 @@ class FFNBlock:
     self.config = config
 
     # --- RMSNorms --------------------------------------------------------
-    self.attn_norm   = nn.RMSNorm(config.dim, config.norm_eps)
-    self.ffn_norm    = nn.RMSNorm(config.dim, config.norm_eps)
+    self.attn_norm   = RMSNorm(config.dim, config.norm_eps)
+    self.ffn_norm    = RMSNorm(config.dim, config.norm_eps)
 
     # --- feed-forward (MoE or dense) -------------------------------------
     if config.num_experts > 0:
@@ -178,7 +185,7 @@ class TransformerBlock(FFNBlock):
     self.attn_k      = Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
     self.attn_v      = Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
     self.attn_output = Linear(config.head_dim * config.n_heads, config.dim, bias=False)
-    if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
+    if config.qk_norm: self.attn_q_norm, self.attn_k_norm = RMSNorm(config.qk_norm, config.norm_eps), RMSNorm(config.qk_norm, config.norm_eps)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
@@ -248,12 +255,12 @@ class MLATransformerBlock(FFNBlock):
     super().__init__(config)
     if config.q_lora_rank is not None:
       self.attn_q_a = Linear(config.dim, config.q_lora_rank, bias=False)
-      self.attn_q_norm = nn.RMSNorm(config.q_lora_rank, config.norm_eps)
+      self.attn_q_norm = RMSNorm(config.q_lora_rank, config.norm_eps)
       self.attn_q_b = Linear(config.q_lora_rank, config.n_heads * config.head_dim, bias=False)
     else:
       self.attn_q = Linear(config.dim, config.n_heads * config.head_dim, bias=False)
     self.attn_kv_a_mqa = Linear(config.dim, config.kv_lora_rank + config.rope_dim, bias=False)
-    self.attn_kv_a_norm = nn.RMSNorm(config.kv_lora_rank, config.norm_eps)
+    self.attn_kv_a_norm = RMSNorm(config.kv_lora_rank, config.norm_eps)
     self.attn_k_b = {"weight": Tensor.zeros(config.n_heads, config.kv_lora_rank, qk_nope_head_dim)}
     self.attn_v_b = {"weight": Tensor.zeros(config.n_heads, config.v_head_dim, config.kv_lora_rank)}
     self.attn_output = Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
@@ -307,7 +314,7 @@ class GatedDeltaNetBlock(FFNBlock):
     self.ssm_conv1d = {"weight": Tensor.zeros(self.conv_channels, self.ssm_conv_kernel)}
     self.ssm_dt = {"bias": Tensor.zeros(ssm.inner_size if ssm.kda else self.num_v_heads)}
     self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
-    self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
+    self.ssm_norm, self.ssm_out = RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
@@ -392,7 +399,7 @@ class Transformer:
                                if config.ssm and config.ssm_layers[i] else
                                block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
-    self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
+    self.output_norm = RMSNorm(config.dim, config.norm_eps)
     self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)

@@ -77,6 +77,44 @@ def _q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]
   return q, scale
 
 
+
+
+@functools.cache
+def _rmsnorm_kernel(out:UOp, x:UOp, weight:UOp, tokens:int, dim:int, eps:float) -> UOp:
+  token = UOp.range(tokens, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, 1, AxisType.LOCAL)
+  elems = dim // 32
+  acc = UOp.const(0, dtypes.float32)
+  for i in range(elems):
+    idx = lane + i * 32
+    v = x[token, idx].float()
+    acc = acc + v * v
+  total = _warp_reduce(acc)
+  norm = (total / dim + eps).rsqrt()
+  stores = []
+  for i in range(elems):
+    idx = lane + i * 32
+    v = x[token, idx].float()
+    stores.append(out[token, idx].store((v * norm * weight[idx].float()).cast(out.dtype)))
+  return UOp.group(*stores).end(token, lane).sink(arg=KernelInfo(name="nv_rmsnorm", opts_to_apply=()))
+
+
+def nv_rmsnorm(x:Tensor, weight:Tensor, eps:float=1e-6) -> Tensor:
+  D = x.shape[-1]
+  if not nv_custom_kernels_supported(x.device) or isinstance(D, UOp) or D % 32 != 0:
+    xf = x.float()
+    return (xf * (xf.square().mean(-1, keepdim=True) + eps).rsqrt()).cast(x.dtype) * weight
+  orig_shape = x.shape
+  x_flat = x.reshape(-1, D)
+  tokens = x_flat.shape[0]
+  if isinstance(tokens, UOp):
+    xf = x.float()
+    return (xf * (xf.square().mean(-1, keepdim=True) + eps).rsqrt()).cast(x.dtype) * weight
+  out = Tensor.empty(tokens, D, dtype=x.dtype, device=x.device)
+  res = Tensor.custom_kernel(out, x_flat.contiguous(), weight.contiguous(),
+                             fxn=functools.partial(_rmsnorm_kernel, tokens=tokens, dim=D, eps=eps))[0]
+  return res.reshape(orig_shape)
+
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str="nv_linear_q8_0") -> UOp:
   chunks = (group_count+31)//32
   token_output = UOp.range(out.shape[0]*out_features, 0, AxisType.GLOBAL)
