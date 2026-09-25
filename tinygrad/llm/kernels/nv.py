@@ -69,7 +69,10 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, tokens:int, in_features:int) ->
   q2 = _nv_shuffle_idx(q_val, word_lane * 4 + 2)
   q3 = _nv_shuffle_idx(q_val, word_lane * 4 + 3)
   word = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24)
-  stores = (q[token, group, lane].store(word), scale[token, group, lane].store(group_scale))
+  # q holds 8 words (32 B) per group: lanes 0..7 store the valid words, lanes 8..31
+  # duplicate word 7 (same value, keeps all 32 lanes active — no warp predication).
+  # scale holds 1 f32 per group: all lanes store the identical value (one 32 B sector).
+  stores = (q[token, group, word_lane].store(word), scale[token, group, 0].store(group_scale))
   return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="nv_q8_quantize", opts_to_apply=()))
 
 
@@ -78,8 +81,8 @@ def _q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]
   key = (tokens, in_features)
   if key in x._q8_cache: return x._q8_cache[key]
   groups = in_features // Q8_GROUP_SIZE
-  q = Tensor.empty(tokens, groups, 32, dtype=dtypes.uint32, device=x.device)
-  scale = Tensor.empty(tokens, groups, 32, dtype=dtypes.float32, device=x.device)
+  q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=x.device)
+  scale = Tensor.empty(tokens, groups, 1, dtype=dtypes.float32, device=x.device)
   q, scale = Tensor.custom_kernel(q, scale, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))[:2]
   x._q8_cache[key] = (q, scale)
   return q, scale
@@ -119,6 +122,53 @@ def nv_rmsnorm(x:Tensor, weight:Tensor, eps:float=1e-6) -> Tensor:
   res = Tensor.custom_kernel(out, x_flat.contiguous(), weight.contiguous(),
                              fxn=functools.partial(_rmsnorm_kernel, tokens=tokens, dim=D, eps=eps))[0]
   return res.reshape(orig_shape)
+
+
+@functools.cache
+def _add_rmsnorm_kernel(h_out:UOp, norm_out:UOp, x:UOp, res:UOp, weight:UOp, tokens:int, dim:int, eps:float) -> UOp:
+  # Fused residual add + RMSNorm: h = x + res, out = rmsnorm(h) * weight.
+  # The per-lane sums are single UOp values reused in both the accumulation and the
+  # stores, so the renderer keeps them in registers (no DRAM round-trip for h before
+  # normalization). The sum keeps the source dtype, matching the standalone add kernel
+  # bit-for-bit (the E_* add of the unfused path).
+  # ponytail: dims up to 5120 hold 160 f32 sums/thread (~200 regs); if a wider dim
+  # spills, reload x/res in the store pass (like _rmsnorm_kernel) — costs 2 loads/elt.
+  token = UOp.range(tokens, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, 1, AxisType.LOCAL)
+  elems = dim // 32
+  vals = []
+  acc = UOp.const(0, dtypes.float32)
+  for i in range(elems):
+    idx = lane + i * 32
+    v = x[token, idx] + res[token, idx]
+    vals.append(v)
+    acc = acc + v.float() * v.float()
+  total = _warp_reduce(acc)
+  norm = (total / dim + eps).rsqrt()
+  stores = []
+  for i, v in enumerate(vals):
+    idx = lane + i * 32
+    stores.append(h_out[token, idx].store(v))
+    stores.append(norm_out[token, idx].store((v.float() * norm * weight[idx].float()).cast(norm_out.dtype)))
+  return UOp.group(*stores).end(token, lane).sink(arg=KernelInfo(name="nv_add_rmsnorm", opts_to_apply=()))
+
+
+def nv_add_rmsnorm(x:Tensor, residual:Tensor, weight:Tensor, eps:float=1e-6) -> tuple[Tensor, Tensor]:
+  """Fused residual add + RMSNorm: returns (h, rmsnorm(h) * weight) with h = x + residual."""
+  D = x.shape[-1]
+  if not nv_custom_kernels_supported(x.device) or weight is None or isinstance(D, UOp) or D % 32 != 0:
+    h = x + residual
+    return h, nv_rmsnorm(h, weight, eps)
+  orig_shape = x.shape
+  x_flat = x.reshape(-1, D)
+  r_flat = residual.reshape(-1, D)
+  tokens = x_flat.shape[0]
+  h = Tensor.empty(tokens, D, dtype=x.dtype, device=x.device)
+  out = Tensor.empty(tokens, D, dtype=x.dtype, device=x.device)
+  h, out = Tensor.custom_kernel(h, out, x_flat.contiguous(), r_flat.contiguous(), weight.contiguous(),
+                                fxn=functools.partial(_add_rmsnorm_kernel, tokens=tokens, dim=D, eps=eps))[:2]
+  return h.reshape(orig_shape), out.reshape(orig_shape)
+
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str="nv_linear_q8_0") -> UOp:
   chunks = (group_count+31)//32

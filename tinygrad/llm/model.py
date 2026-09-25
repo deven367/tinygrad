@@ -3,7 +3,7 @@ import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_rmsnorm, nv_normalize
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_rmsnorm, nv_add_rmsnorm, nv_normalize
 from tinygrad.llm.gguf import gguf_load
 
 class RMSNorm(nn.RMSNorm):
@@ -155,8 +155,9 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + self._attention(self.attn_norm(x), start_pos)
-      return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
+      attn_out = self._attention(self.attn_norm(x), start_pos)
+      h, h_normed = nv_add_rmsnorm(x, attn_out, self.ffn_norm.weight, self.ffn_norm.eps)
+      return (h + self._feed_forward(h_normed)).contiguous()
     return _run(x, start_pos)
 
 Q8_GROUP_SIZE = 32
