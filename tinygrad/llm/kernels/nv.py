@@ -107,9 +107,6 @@ def nv_rmsnorm(x:Tensor, weight:Tensor, eps:float=1e-6) -> Tensor:
   orig_shape = x.shape
   x_flat = x.reshape(-1, D)
   tokens = x_flat.shape[0]
-  if isinstance(tokens, UOp):
-    xf = x.float()
-    return (xf * (xf.square().mean(-1, keepdim=True) + eps).rsqrt()).cast(x.dtype) * weight
   out = Tensor.empty(tokens, D, dtype=x.dtype, device=x.device)
   res = Tensor.custom_kernel(out, x_flat.contiguous(), weight.contiguous(),
                              fxn=functools.partial(_rmsnorm_kernel, tokens=tokens, dim=D, eps=eps))[0]
