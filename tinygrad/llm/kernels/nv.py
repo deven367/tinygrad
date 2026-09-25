@@ -74,15 +74,9 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, tokens:int, in_features:int) ->
 
 
 def _q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]:
+  if not hasattr(x, '_q8_cache'): x._q8_cache = {}
   key = (tokens, in_features)
-  if hasattr(x, "_q8_cache") and key in x._q8_cache: return x._q8_cache[key]
-  curr = getattr(x, "uop", None)
-  visited = set()
-  while curr is not None and curr not in visited:
-    visited.add(curr)
-    if hasattr(curr, "_q8_cache") and key in curr._q8_cache: return curr._q8_cache[key]
-    curr = curr.src[0] if getattr(curr, "src", None) else None
-  if not hasattr(x, "_q8_cache"): x._q8_cache = {}
+  if key in x._q8_cache: return x._q8_cache[key]
   groups = in_features // Q8_GROUP_SIZE
   q = Tensor.empty(tokens, groups, 32, dtype=dtypes.uint32, device=x.device)
   scale = Tensor.empty(tokens, groups, 32, dtype=dtypes.float32, device=x.device)
@@ -91,8 +85,10 @@ def _q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]
   return q, scale
 
 
+
+
 @functools.cache
-def _rmsnorm_kernel(out:UOp, q:UOp, scale:UOp, x:UOp, weight:UOp, tokens:int, dim:int, eps:float) -> UOp:
+def _rmsnorm_kernel(out:UOp, x:UOp, weight:UOp, tokens:int, dim:int, eps:float) -> UOp:
   token = UOp.range(tokens, 0, AxisType.GLOBAL)
   lane = UOp.range(32, 1, AxisType.LOCAL)
   elems = dim // 32
@@ -104,23 +100,11 @@ def _rmsnorm_kernel(out:UOp, q:UOp, scale:UOp, x:UOp, weight:UOp, tokens:int, di
   total = _warp_reduce(acc)
   norm = (total / dim + eps).rsqrt()
   stores = []
-  word_lane = lane.minimum(7)
   for i in range(elems):
     idx = lane + i * 32
     v = x[token, idx].float()
-    norm_val = v * norm * weight[idx].float()
-    stores.append(out[token, idx].store(norm_val.cast(out.dtype)))
-    # On-the-fly Q8_0 activation quantization
-    g_scale = (_warp_reduce(norm_val.abs(), maximum=True) / 127.0).maximum(1e-8)
-    q_val = (norm_val / g_scale).round().clip(-127, 127).cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32)
-    q0 = _nv_shuffle_idx(q_val, word_lane * 4)
-    q1 = _nv_shuffle_idx(q_val, word_lane * 4 + 1)
-    q2 = _nv_shuffle_idx(q_val, word_lane * 4 + 2)
-    q3 = _nv_shuffle_idx(q_val, word_lane * 4 + 3)
-    word = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24)
-    stores.append(q[token, i, lane].store(word))
-    stores.append(scale[token, i, lane].store(g_scale))
-  return UOp.group(*stores).end(token, lane).sink(arg=KernelInfo(name="nv_rmsnorm_q8", opts_to_apply=()))
+    stores.append(out[token, idx].store((v * norm * weight[idx].float()).cast(out.dtype)))
+  return UOp.group(*stores).end(token, lane).sink(arg=KernelInfo(name="nv_rmsnorm", opts_to_apply=()))
 
 
 def nv_rmsnorm(x:Tensor, weight:Tensor, eps:float=1e-6) -> Tensor:
@@ -131,20 +115,10 @@ def nv_rmsnorm(x:Tensor, weight:Tensor, eps:float=1e-6) -> Tensor:
   orig_shape = x.shape
   x_flat = x.reshape(-1, D)
   tokens = x_flat.shape[0]
-  groups = D // Q8_GROUP_SIZE
   out = Tensor.empty(tokens, D, dtype=x.dtype, device=x.device)
-  q = Tensor.empty(tokens, groups, 32, dtype=dtypes.uint32, device=x.device)
-  scale = Tensor.empty(tokens, groups, 32, dtype=dtypes.float32, device=x.device)
-  out, q, scale = Tensor.custom_kernel(out, q, scale, x_flat.contiguous(), weight.contiguous(),
-                                       fxn=functools.partial(_rmsnorm_kernel, tokens=tokens, dim=D, eps=eps))[:3]
-  res = out.reshape(orig_shape)
-  cache = {(tokens, D): (q, scale)}
-  res._q8_cache = cache
-  res.uop._q8_cache = cache
-  out._q8_cache = cache
-  out.uop._q8_cache = cache
-  return res
-
+  res = Tensor.custom_kernel(out, x_flat.contiguous(), weight.contiguous(),
+                             fxn=functools.partial(_rmsnorm_kernel, tokens=tokens, dim=D, eps=eps))[0]
+  return res.reshape(orig_shape)
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str="nv_linear_q8_0") -> UOp:
   chunks = (group_count+31)//32
