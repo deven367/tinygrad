@@ -3,6 +3,11 @@
 Q4_K block: 256 weights = 144 bytes: d(2) dmin(2) scales(12) qs(128). 4-bit nibbles.
 144 = 36 uint32 -> 4-byte aligned, safe for plain uint32 loads (no misaligned access).
 Activation quantization is the SAME q8_quantize as the Q8_0 path (xq/xd 32-element groups).
+
+Optimizations:
+- 128-bit vectorized memory loads (uint4 / v4.u32) for num_blocks % 4 == 0.
+- 64-bit vectorized memory loads (uint2 / v2.u32) for num_blocks % 2 == 0.
+- Fallback cooperative warp GEMV for odd num_blocks.
 """
 from __future__ import annotations
 import functools
@@ -39,7 +44,189 @@ def _half(value:UOp) -> UOp: return value.cast(dtypes.uint16).bitcast(dtypes.flo
 
 
 @functools.cache
+def _q4_k_v4_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_features:int) -> UOp:
+  """128-bit vectorized cooperative warp kernel: 8 threads/block, 4 words/thread (uint4)."""
+  num_blocks = in_features // GGML_BLOCK_SIZE
+  assert num_blocks % 4 == 0, f"num_blocks must be divisible by 4, got {num_blocks}"
+  token_output = UOp.range(out.shape[0]*out_features, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, 1, AxisType.LOCAL)
+  token = token_output // out_features
+  output = token_output % out_features
+
+  lane8 = lane & 7
+  block_in_quad = lane >> 3
+  pair = lane8 >> 1
+  k = lane8 & 1
+  subgroup_even = pair * 2
+  subgroup_odd = pair * 2 + 1
+
+  w0_idx = k * 4
+  w1_idx = k * 4 + 1
+  w2_idx = k * 4 + 2
+  w3_idx = k * 4 + 3
+
+  acc = UOp.const(0, dtypes.float32)
+
+  for b_quad in range(num_blocks // 4):
+    b = b_quad * 4 + block_in_quad
+    base = (output * num_blocks + b) * Q4_WORDS
+
+    raw_idx = base + 4 + pair * 8 + k * 4
+    w0 = raw[raw_idx]
+    w1 = raw[raw_idx + 1]
+    w2 = raw[raw_idx + 2]
+    w3 = raw[raw_idx + 3]
+
+    grp_even = b * 8 + subgroup_even
+    grp_odd = b * 8 + subgroup_odd
+
+    x0_even = xq[token, grp_even, w0_idx].load()
+    x1_even = xq[token, grp_even, w1_idx].load()
+    x2_even = xq[token, grp_even, w2_idx].load()
+    x3_even = xq[token, grp_even, w3_idx].load()
+
+    x0_odd  = xq[token, grp_odd,  w0_idx].load()
+    x1_odd  = xq[token, grp_odd,  w1_idx].load()
+    x2_odd  = xq[token, grp_odd,  w2_idx].load()
+    x3_odd  = xq[token, grp_odd,  w3_idx].load()
+
+    w0_even = w0 & 0x0f0f0f0f
+    w0_odd  = (w0 >> 4) & 0x0f0f0f0f
+    w1_even = w1 & 0x0f0f0f0f
+    w1_odd  = (w1 >> 4) & 0x0f0f0f0f
+    w2_even = w2 & 0x0f0f0f0f
+    w2_odd  = (w2 >> 4) & 0x0f0f0f0f
+    w3_even = w3 & 0x0f0f0f0f
+    w3_odd  = (w3 >> 4) & 0x0f0f0f0f
+
+    dot_even = _nv_dp4a(w0_even, x0_even, UOp.const(0, dtypes.int32))
+    dot_even = _nv_dp4a(w1_even, x1_even, dot_even)
+    dot_even = _nv_dp4a(w2_even, x2_even, dot_even)
+    dot_even = _nv_dp4a(w3_even, x3_even, dot_even)
+
+    qsum_even = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x0_even, UOp.const(0, dtypes.int32))
+    qsum_even = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x1_even, qsum_even)
+    qsum_even = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x2_even, qsum_even)
+    qsum_even = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x3_even, qsum_even)
+
+    dot_odd = _nv_dp4a(w0_odd, x0_odd, UOp.const(0, dtypes.int32))
+    dot_odd = _nv_dp4a(w1_odd, x1_odd, dot_odd)
+    dot_odd = _nv_dp4a(w2_odd, x2_odd, dot_odd)
+    dot_odd = _nv_dp4a(w3_odd, x3_odd, dot_odd)
+
+    qsum_odd = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x0_odd, UOp.const(0, dtypes.int32))
+    qsum_odd = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x1_odd, qsum_odd)
+    qsum_odd = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x2_odd, qsum_odd)
+    qsum_odd = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x3_odd, qsum_odd)
+
+    sc_even = (subgroup_even < 4).where(_load_byte(raw, base, 4 + subgroup_even) & 63,
+      (_load_byte(raw, base, 8 + subgroup_even) & 15) | ((_load_byte(raw, base, subgroup_even) >> 6) << 4))
+    m_even = (subgroup_even < 4).where(_load_byte(raw, base, 8 + subgroup_even) & 63,
+      (_load_byte(raw, base, 8 + subgroup_even) >> 4) | ((_load_byte(raw, base, 4 + subgroup_even) >> 6) << 4))
+
+    sc_odd = (subgroup_odd < 4).where(_load_byte(raw, base, 4 + subgroup_odd) & 63,
+      (_load_byte(raw, base, 8 + subgroup_odd) & 15) | ((_load_byte(raw, base, subgroup_odd) >> 6) << 4))
+    m_odd = (subgroup_odd < 4).where(_load_byte(raw, base, 8 + subgroup_odd) & 63,
+      (_load_byte(raw, base, 8 + subgroup_odd) >> 4) | ((_load_byte(raw, base, 4 + subgroup_odd) >> 6) << 4))
+
+    d = _half(raw[base] & 0xffff)
+    dmin = _half((raw[base] >> 16).cast(dtypes.uint32) & 0xffff)
+
+    xd_even = xd[token, grp_even, 0]
+    xd_odd  = xd[token, grp_odd,  0]
+
+    val_even = (dot_even.float()*d*sc_even.float() - qsum_even.float()*dmin*m_even.float()) * xd_even
+    val_odd  = (dot_odd.float() *d*sc_odd.float()  - qsum_odd.float() *dmin*m_odd.float() ) * xd_odd
+
+    acc = acc + val_even + val_odd
+
+  total = _warp_reduce(acc)
+  return out[token, output, lane].store(total.cast(out.dtype)).end(token_output, lane).sink(
+    arg=KernelInfo(name="nv_linear_q4_k_v4", opts_to_apply=()))
+
+
+@functools.cache
+def _q4_k_v2_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_features:int) -> UOp:
+  """64-bit vectorized cooperative warp kernel: 16 threads/block, 2 words/thread (uint2)."""
+  num_blocks = in_features // GGML_BLOCK_SIZE
+  assert num_blocks % 2 == 0, f"num_blocks must be even, got {num_blocks}"
+  token_output = UOp.range(out.shape[0]*out_features, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, 1, AxisType.LOCAL)
+  token = token_output // out_features
+  output = token_output % out_features
+
+  lane16 = lane & 15
+  block_in_pair = lane >> 4
+  pair = lane16 >> 2
+  k = lane16 & 3
+  subgroup_even = pair * 2
+  subgroup_odd = pair * 2 + 1
+
+  w0_idx = k * 2
+  w1_idx = k * 2 + 1
+
+  acc = UOp.const(0, dtypes.float32)
+
+  for b_pair in range(num_blocks // 2):
+    b = b_pair * 2 + block_in_pair
+    base = (output * num_blocks + b) * Q4_WORDS
+
+    raw_idx = base + 4 + pair * 8 + k * 2
+    w0 = raw[raw_idx]
+    w1 = raw[raw_idx + 1]
+
+    grp_even = b * 8 + subgroup_even
+    grp_odd = b * 8 + subgroup_odd
+
+    x0_even = xq[token, grp_even, w0_idx].load()
+    x1_even = xq[token, grp_even, w1_idx].load()
+    x0_odd  = xq[token, grp_odd,  w0_idx].load()
+    x1_odd  = xq[token, grp_odd,  w1_idx].load()
+
+    w0_even = w0 & 0x0f0f0f0f
+    w0_odd  = (w0 >> 4) & 0x0f0f0f0f
+    w1_even = w1 & 0x0f0f0f0f
+    w1_odd  = (w1 >> 4) & 0x0f0f0f0f
+
+    dot_even = _nv_dp4a(w0_even, x0_even, UOp.const(0, dtypes.int32))
+    dot_even = _nv_dp4a(w1_even, x1_even, dot_even)
+    qsum_even = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x0_even, UOp.const(0, dtypes.int32))
+    qsum_even = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x1_even, qsum_even)
+
+    dot_odd = _nv_dp4a(w0_odd, x0_odd, UOp.const(0, dtypes.int32))
+    dot_odd = _nv_dp4a(w1_odd, x1_odd, dot_odd)
+    qsum_odd = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x0_odd, UOp.const(0, dtypes.int32))
+    qsum_odd = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x1_odd, qsum_odd)
+
+    sc_even = (subgroup_even < 4).where(_load_byte(raw, base, 4 + subgroup_even) & 63,
+      (_load_byte(raw, base, 8 + subgroup_even) & 15) | ((_load_byte(raw, base, subgroup_even) >> 6) << 4))
+    m_even = (subgroup_even < 4).where(_load_byte(raw, base, 8 + subgroup_even) & 63,
+      (_load_byte(raw, base, 8 + subgroup_even) >> 4) | ((_load_byte(raw, base, 4 + subgroup_even) >> 6) << 4))
+
+    sc_odd = (subgroup_odd < 4).where(_load_byte(raw, base, 4 + subgroup_odd) & 63,
+      (_load_byte(raw, base, 8 + subgroup_odd) & 15) | ((_load_byte(raw, base, subgroup_odd) >> 6) << 4))
+    m_odd = (subgroup_odd < 4).where(_load_byte(raw, base, 8 + subgroup_odd) & 63,
+      (_load_byte(raw, base, 8 + subgroup_odd) >> 4) | ((_load_byte(raw, base, 4 + subgroup_odd) >> 6) << 4))
+
+    d = _half(raw[base] & 0xffff)
+    dmin = _half((raw[base] >> 16).cast(dtypes.uint32) & 0xffff)
+
+    xd_even = xd[token, grp_even, 0]
+    xd_odd  = xd[token, grp_odd,  0]
+
+    val_even = (dot_even.float()*d*sc_even.float() - qsum_even.float()*dmin*m_even.float()) * xd_even
+    val_odd  = (dot_odd.float() *d*sc_odd.float()  - qsum_odd.float() *dmin*m_odd.float() ) * xd_odd
+
+    acc = acc + val_even + val_odd
+
+  total = _warp_reduce(acc)
+  return out[token, output, lane].store(total.cast(out.dtype)).end(token_output, lane).sink(
+    arg=KernelInfo(name="nv_linear_q4_k_v2", opts_to_apply=()))
+
+
+@functools.cache
 def _q4_k_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_features:int) -> UOp:
+  """Cooperative warp fallback kernel: 32 threads/block, 1 word/thread."""
   num_blocks = in_features // GGML_BLOCK_SIZE
   token_output = UOp.range(out.shape[0]*out_features, 0, AxisType.GLOBAL)
   lane = UOp.range(32, 1, AxisType.LOCAL)
@@ -106,7 +293,13 @@ def q4_k_linear(layer:Any, x:Tensor) -> Tensor:
   out = Tensor.empty(tokens, out_features, 32, dtype=dtypes.float32, device=x.device).uop
   all_srcs = (out, raw, xq.uop, xd.uop)
   params = tuple(UOp.placeholder_like(src, slot=i) for i,src in enumerate(all_srcs))
-  kernel = _q4_k_decode_kernel(*params, out_features=out_features, in_features=in_features).call(*all_srcs)
+  num_blocks = in_features // GGML_BLOCK_SIZE
+  if num_blocks % 4 == 0:
+    kernel = _q4_k_v4_decode_kernel(*params, out_features=out_features, in_features=in_features).call(*all_srcs)
+  elif num_blocks % 2 == 0:
+    kernel = _q4_k_v2_decode_kernel(*params, out_features=out_features, in_features=in_features).call(*all_srcs)
+  else:
+    kernel = _q4_k_decode_kernel(*params, out_features=out_features, in_features=in_features).call(*all_srcs)
   result = Tensor(out.after(kernel))[..., 0]
   result = result.reshape(*x.shape[:-1], out_features)
   return result if layer.bias is None else result + layer.bias
