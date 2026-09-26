@@ -43,6 +43,18 @@ def _load_byte(raw:UOp, base:UOp, offset:int) -> UOp:
 def _half(value:UOp) -> UOp: return value.cast(dtypes.uint16).bitcast(dtypes.float16).float()
 
 
+def _q4k_scales(hdr0:UOp, hdr1:UOp, hdr2:UOp, hdr3:UOp, pair:UOp) -> tuple[UOp, UOp, UOp, UOp, UOp, UOp]:
+  shift_even = ((pair & 1) * 16).cast(dtypes.uint32)
+  shift_odd  = shift_even + 8
+  sc_even = (pair < 2).where((hdr1 >> shift_even) & 63, ((hdr3 >> shift_even) & 15) | ((((hdr1 >> shift_even) & 255) >> 6) << 4))
+  m_even  = (pair < 2).where((hdr2 >> shift_even) & 63, (((hdr3 >> shift_even) & 255) >> 4) | ((((hdr2 >> shift_even) & 255) >> 6) << 4))
+  sc_odd  = (pair < 2).where((hdr1 >> shift_odd) & 63, ((hdr3 >> shift_odd) & 15) | ((((hdr1 >> shift_odd) & 255) >> 6) << 4))
+  m_odd   = (pair < 2).where((hdr2 >> shift_odd) & 63, (((hdr3 >> shift_odd) & 255) >> 4) | ((((hdr2 >> shift_odd) & 255) >> 6) << 4))
+  d = _half(hdr0 & 0xffff)
+  dmin = _half((hdr0 >> 16).cast(dtypes.uint32) & 0xffff)
+  return d, dmin, sc_even, m_even, sc_odd, m_odd
+
+
 @functools.cache
 def _q4_k_v4_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_features:int) -> UOp:
   """128-bit vectorized cooperative warp kernel: 8 threads/block, 4 words/thread (uint4)."""
@@ -70,6 +82,11 @@ def _q4_k_v4_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, i
   for b_quad in range(num_blocks // 4):
     b = b_quad * 4 + block_in_quad
     base = (output * num_blocks + b) * Q4_WORDS
+
+    hdr0 = raw[base]
+    hdr1 = raw[base + 1]
+    hdr2 = raw[base + 2]
+    hdr3 = raw[base + 3]
 
     raw_idx = base + 4 + pair * 8 + k * 4
     w0 = raw[raw_idx]
@@ -119,18 +136,7 @@ def _q4_k_v4_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, i
     qsum_odd = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x2_odd, qsum_odd)
     qsum_odd = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x3_odd, qsum_odd)
 
-    sc_even = (subgroup_even < 4).where(_load_byte(raw, base, 4 + subgroup_even) & 63,
-      (_load_byte(raw, base, 8 + subgroup_even) & 15) | ((_load_byte(raw, base, subgroup_even) >> 6) << 4))
-    m_even = (subgroup_even < 4).where(_load_byte(raw, base, 8 + subgroup_even) & 63,
-      (_load_byte(raw, base, 8 + subgroup_even) >> 4) | ((_load_byte(raw, base, 4 + subgroup_even) >> 6) << 4))
-
-    sc_odd = (subgroup_odd < 4).where(_load_byte(raw, base, 4 + subgroup_odd) & 63,
-      (_load_byte(raw, base, 8 + subgroup_odd) & 15) | ((_load_byte(raw, base, subgroup_odd) >> 6) << 4))
-    m_odd = (subgroup_odd < 4).where(_load_byte(raw, base, 8 + subgroup_odd) & 63,
-      (_load_byte(raw, base, 8 + subgroup_odd) >> 4) | ((_load_byte(raw, base, 4 + subgroup_odd) >> 6) << 4))
-
-    d = _half(raw[base] & 0xffff)
-    dmin = _half((raw[base] >> 16).cast(dtypes.uint32) & 0xffff)
+    d, dmin, sc_even, m_even, sc_odd, m_odd = _q4k_scales(hdr0, hdr1, hdr2, hdr3, pair)
 
     xd_even = xd[token, grp_even, 0]
     xd_odd  = xd[token, grp_odd,  0]
@@ -171,6 +177,11 @@ def _q4_k_v2_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, i
     b = b_pair * 2 + block_in_pair
     base = (output * num_blocks + b) * Q4_WORDS
 
+    hdr0 = raw[base]
+    hdr1 = raw[base + 1]
+    hdr2 = raw[base + 2]
+    hdr3 = raw[base + 3]
+
     raw_idx = base + 4 + pair * 8 + k * 2
     w0 = raw[raw_idx]
     w1 = raw[raw_idx + 1]
@@ -198,18 +209,7 @@ def _q4_k_v2_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, i
     qsum_odd = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x0_odd, UOp.const(0, dtypes.int32))
     qsum_odd = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x1_odd, qsum_odd)
 
-    sc_even = (subgroup_even < 4).where(_load_byte(raw, base, 4 + subgroup_even) & 63,
-      (_load_byte(raw, base, 8 + subgroup_even) & 15) | ((_load_byte(raw, base, subgroup_even) >> 6) << 4))
-    m_even = (subgroup_even < 4).where(_load_byte(raw, base, 8 + subgroup_even) & 63,
-      (_load_byte(raw, base, 8 + subgroup_even) >> 4) | ((_load_byte(raw, base, 4 + subgroup_even) >> 6) << 4))
-
-    sc_odd = (subgroup_odd < 4).where(_load_byte(raw, base, 4 + subgroup_odd) & 63,
-      (_load_byte(raw, base, 8 + subgroup_odd) & 15) | ((_load_byte(raw, base, subgroup_odd) >> 6) << 4))
-    m_odd = (subgroup_odd < 4).where(_load_byte(raw, base, 8 + subgroup_odd) & 63,
-      (_load_byte(raw, base, 8 + subgroup_odd) >> 4) | ((_load_byte(raw, base, 4 + subgroup_odd) >> 6) << 4))
-
-    d = _half(raw[base] & 0xffff)
-    dmin = _half((raw[base] >> 16).cast(dtypes.uint32) & 0xffff)
+    d, dmin, sc_even, m_even, sc_odd, m_odd = _q4k_scales(hdr0, hdr1, hdr2, hdr3, pair)
 
     xd_even = xd[token, grp_even, 0]
     xd_odd  = xd[token, grp_odd,  0]
@@ -242,6 +242,12 @@ def _q4_k_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_f
 
   for b in range(num_blocks):
     base = (output * num_blocks + b) * Q4_WORDS
+
+    hdr0 = raw[base]
+    hdr1 = raw[base + 1]
+    hdr2 = raw[base + 2]
+    hdr3 = raw[base + 3]
+
     w = raw[base + 4 + lane]
 
     grp_even = b * 8 + subgroup_even
@@ -259,18 +265,7 @@ def _q4_k_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_f
     dot_odd = _nv_dp4a(w_odd, x_odd, UOp.const(0, dtypes.int32))
     qsum_odd = _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), x_odd, UOp.const(0, dtypes.int32))
 
-    sc_even = (subgroup_even < 4).where(_load_byte(raw, base, 4 + subgroup_even) & 63,
-      (_load_byte(raw, base, 8 + subgroup_even) & 15) | ((_load_byte(raw, base, subgroup_even) >> 6) << 4))
-    m_even = (subgroup_even < 4).where(_load_byte(raw, base, 8 + subgroup_even) & 63,
-      (_load_byte(raw, base, 8 + subgroup_even) >> 4) | ((_load_byte(raw, base, 4 + subgroup_even) >> 6) << 4))
-
-    sc_odd = (subgroup_odd < 4).where(_load_byte(raw, base, 4 + subgroup_odd) & 63,
-      (_load_byte(raw, base, 8 + subgroup_odd) & 15) | ((_load_byte(raw, base, subgroup_odd) >> 6) << 4))
-    m_odd = (subgroup_odd < 4).where(_load_byte(raw, base, 8 + subgroup_odd) & 63,
-      (_load_byte(raw, base, 8 + subgroup_odd) >> 4) | ((_load_byte(raw, base, 4 + subgroup_odd) >> 6) << 4))
-
-    d = _half(raw[base] & 0xffff)
-    dmin = _half((raw[base] >> 16).cast(dtypes.uint32) & 0xffff)
+    d, dmin, sc_even, m_even, sc_odd, m_odd = _q4k_scales(hdr0, hdr1, hdr2, hdr3, pair)
 
     xd_even = xd[token, grp_even, 0]
     xd_odd  = xd[token, grp_odd,  0]
