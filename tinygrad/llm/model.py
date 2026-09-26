@@ -3,7 +3,7 @@ import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_rmsnorm, nv_add_rmsnorm, nv_normalize
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_rmsnorm, nv_add_rmsnorm, nv_normalize, nv_argmax
 from tinygrad.llm.gguf import gguf_load
 
 class RMSNorm(nn.RMSNorm):
@@ -415,7 +415,7 @@ class Transformer:
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
-    return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+    return nv_argmax(logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log(), keepdim=True)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)

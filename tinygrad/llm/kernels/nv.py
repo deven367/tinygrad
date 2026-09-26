@@ -247,3 +247,90 @@ def nv_normalize(x:Tensor, eps:float=1e-6) -> Tensor:
   res = Tensor.custom_kernel(out, x_flat.contiguous(),
                              fxn=functools.partial(_l2norm_kernel, tokens=tokens, dim=D, eps=eps))[0]
   return res.reshape(orig_shape)
+
+
+# **************** Fused 2-Stage Argmax Reduction ****************
+
+def _nv_pack64(f:UOp, idx:UOp) -> UOp:
+  return UOp(Ops.CUSTOMI, dtypes.uint64, (f, idx),
+             arg="([&](float f, int idx) {{ unsigned int u = __float_as_uint(f); unsigned int s = u ^ (((int)u >> 31) | 0x80000000); return (((unsigned long long)s << 32) | (unsigned int)(~idx)); }}({0}, {1}))")
+
+def _nv_unpack_idx(packed:UOp) -> UOp:
+  return UOp(Ops.CUSTOMI, dtypes.int32, (packed,),
+             arg="((int)(~(unsigned int)({0})))")
+
+def _nv_umax64(a:UOp, b:UOp) -> UOp:
+  return UOp(Ops.CUSTOMI, dtypes.uint64, (a, b),
+             arg="max((unsigned long long){0}, (unsigned long long){1})")
+
+def _nv_shuffle_xor64(val:UOp, offset:int) -> UOp:
+  return UOp(Ops.CUSTOMI, dtypes.uint64, (val,),
+             arg=f"__shfl_xor_sync(0xffffffff, (unsigned long long){{0}}, {offset}, 32)")
+
+@functools.cache
+def _argmax_partial_kernel(pout:UOp, x:UOp, tokens:int, num_blocks:int, tile:int) -> UOp:
+  elems = tile * 32
+  token_blk = UOp.range(tokens * num_blocks, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, 1, AxisType.LOCAL)
+  token = token_blk // num_blocks
+  blk = token_blk % num_blocks
+
+  best = UOp.const(0, dtypes.uint64)
+  for step in range(tile):
+    flat_lane_idx = blk * elems + step * 32 + lane
+    v = x[token, flat_lane_idx].load().float()
+    step_idx = blk * elems + step * 32 + lane
+    packed = _nv_pack64(v, step_idx)
+    best = _nv_umax64(best, packed)
+
+  for offset in (16, 8, 4, 2, 1):
+    other = _nv_shuffle_xor64(best, offset)
+    best = _nv_umax64(best, other)
+
+  store = pout[token, blk, lane].store(best)
+  return store.end(token_blk, lane).sink(arg=KernelInfo(name="nv_argmax_partial", opts_to_apply=()))
+
+@functools.cache
+def _argmax_final_kernel(out:UOp, pin:UOp, tokens:int, num_blocks:int) -> UOp:
+  token = UOp.range(tokens, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, 1, AxisType.LOCAL)
+
+  iters = (num_blocks + 31) // 32
+  best = UOp.const(0, dtypes.uint64)
+  for i in range(iters):
+    b = lane + i * 32
+    valid = b < num_blocks
+    p = valid.where(pin[token, b.minimum(num_blocks - 1), lane].load(), UOp.const(0, dtypes.uint64))
+    best = _nv_umax64(best, p)
+
+  for offset in (16, 8, 4, 2, 1):
+    other = _nv_shuffle_xor64(best, offset)
+    best = _nv_umax64(best, other)
+
+  final_idx = _nv_unpack_idx(best)
+  store = out[token, lane].store(final_idx)
+  return store.end(token, lane).sink(arg=KernelInfo(name="nv_argmax_final", opts_to_apply=()))
+
+def nv_argmax(x:Tensor, axis:int=-1, keepdim:bool=True) -> Tensor:
+  """Fused two-stage warp argmax with exact bitwise tie-breaking (lowest index wins)."""
+  N = x.shape[-1]
+  if not nv_custom_kernels_supported(x.device) or axis not in (-1, x.ndim - 1) or isinstance(N, UOp) or N % 32 != 0:
+    return x.argmax(axis=axis, keepdim=keepdim)
+
+  tile = 8 if N % 256 == 0 else 1
+  elems = tile * 32
+  num_blocks = N // elems
+  orig_shape = x.shape
+  x_flat = x.reshape(-1, N)
+  tokens = x_flat.shape[0]
+
+  pout = Tensor.empty(tokens, num_blocks, 32, dtype=dtypes.uint64, device=x.device)
+  pout = Tensor.custom_kernel(pout, x_flat.contiguous(),
+                              fxn=functools.partial(_argmax_partial_kernel, tokens=tokens, num_blocks=num_blocks, tile=tile))[0]
+
+  out32 = Tensor.empty(tokens, 32, dtype=dtypes.int32, device=x.device)
+  out32 = Tensor.custom_kernel(out32, pout,
+                               fxn=functools.partial(_argmax_final_kernel, tokens=tokens, num_blocks=num_blocks))[0]
+  res = out32[:, :1].contiguous()
+  if not keepdim: res = res.squeeze(-1)
+  return res.reshape(*orig_shape[:-1], *((1,) if keepdim else ()))
