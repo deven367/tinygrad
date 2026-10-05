@@ -112,7 +112,7 @@ def _rmsnorm_kernel(out:UOp, x:UOp, weight:UOp, tokens:int, dim:int, eps:float) 
 
 def nv_rmsnorm(x:Tensor, weight:Tensor, eps:float=1e-6) -> Tensor:
   D = x.shape[-1]
-  if not nv_custom_kernels_supported(x.device) or isinstance(D, UOp) or D % 32 != 0:
+  if not nv_custom_kernels_supported(x.device) or any(isinstance(s, UOp) for s in x.shape) or D % 32 != 0:
     xf = x.float()
     return (xf * (xf.square().mean(-1, keepdim=True) + eps).rsqrt()).cast(x.dtype) * weight
   orig_shape = x.shape
@@ -156,7 +156,7 @@ def _add_rmsnorm_kernel(h_out:UOp, norm_out:UOp, x:UOp, res:UOp, weight:UOp, tok
 def nv_add_rmsnorm(x:Tensor, residual:Tensor, weight:Tensor, eps:float=1e-6) -> tuple[Tensor, Tensor]:
   """Fused residual add + RMSNorm: returns (h, rmsnorm(h) * weight) with h = x + residual."""
   D = x.shape[-1]
-  if not nv_custom_kernels_supported(x.device) or weight is None or isinstance(D, UOp) or D % 32 != 0:
+  if not nv_custom_kernels_supported(x.device) or weight is None or any(isinstance(s, UOp) for s in x.shape) or any(isinstance(s, UOp) for s in residual.shape) or D % 32 != 0:
     h = x + residual
     return h, nv_rmsnorm(h, weight, eps)
   orig_shape = x.shape
@@ -197,7 +197,7 @@ def _gated_rmsnorm_kernel(out:UOp, x:UOp, gate:UOp, weight:UOp, tokens:int, dim:
 def nv_gated_rmsnorm(x:Tensor, gate:Tensor, weight:Tensor, eps:float=1e-6, is_kda:bool=False, out_dtype=dtypes.half) -> Tensor:
   """Fused RMSNorm + Gate (silu or sigmoid) projection: computes (rmsnorm(x) * weight * act(gate)).cast(out_dtype)."""
   D = x.shape[-1]
-  if not nv_custom_kernels_supported(x.device) or weight is None or isinstance(D, UOp) or D % 32 != 0:
+  if not nv_custom_kernels_supported(x.device) or weight is None or any(isinstance(s, UOp) for s in x.shape) or any(isinstance(s, UOp) for s in gate.shape) or D % 32 != 0:
     act = gate.sigmoid() if is_kda else gate.silu()
     return (nv_rmsnorm(x, weight, eps) * act).cast(out_dtype)
   orig_shape = x.shape
@@ -336,7 +336,7 @@ def _l2norm_kernel(out:UOp, x:UOp, tokens:int, dim:int, eps:float, scale:float=1
 def nv_normalize(x:Tensor, eps:float=1e-6, scale:float=1.0, repeat:int=1) -> Tensor:
   """Fused warp-level L2 normalization: x / max(||x||_2, eps) * scale with optional head repeat."""
   D = x.shape[-1]
-  if not nv_custom_kernels_supported(x.device) or isinstance(D, UOp) or D % 32 != 0:
+  if not nv_custom_kernels_supported(x.device) or any(isinstance(s, UOp) for s in x.shape) or D % 32 != 0:
     res = x.normalize(dim=-1, eps=eps)
     if scale != 1.0: res = res * scale
     return res if repeat == 1 else res.repeat(*((1,)*(len(x.shape)-2)), repeat, 1)
