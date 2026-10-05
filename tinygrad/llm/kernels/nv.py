@@ -3,7 +3,7 @@ import functools, math
 from typing import Any
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.helpers import prod
-from tinygrad.uop.ops import AxisType, KernelInfo, Ops
+from tinygrad.uop.ops import AddrSpace, AxisType, KernelInfo, Ops
 
 Q8_0, GGML_BLOCK_SIZE, Q8_GROUP_SIZE, Q8_U16_WORDS = 8, 32, 32, 17
 
@@ -164,10 +164,51 @@ def nv_add_rmsnorm(x:Tensor, residual:Tensor, weight:Tensor, eps:float=1e-6) -> 
   r_flat = residual.reshape(-1, D)
   tokens = x_flat.shape[0]
   h = Tensor.empty(tokens, D, dtype=x.dtype, device=x.device)
-  out = Tensor.empty(tokens, D, dtype=x.dtype, device=x.device)
+  out = Tensor.empty(tokens, D, dtype=dtypes.half, device=x.device)
   h, out = Tensor.custom_kernel(h, out, x_flat.contiguous(), r_flat.contiguous(), weight.contiguous(),
                                 fxn=functools.partial(_add_rmsnorm_kernel, tokens=tokens, dim=D, eps=eps))[:2]
   return h.reshape(orig_shape), out.reshape(orig_shape)
+
+
+@functools.cache
+def _gated_rmsnorm_kernel(out:UOp, x:UOp, gate:UOp, weight:UOp, tokens:int, dim:int, eps:float, is_kda:bool=False) -> UOp:
+  token = UOp.range(tokens, 0, AxisType.GLOBAL)
+  lane = UOp.range(32, 1, AxisType.LOCAL)
+  elems = dim // 32
+  vals = []
+  acc = UOp.const(0, dtypes.float32)
+  for i in range(elems):
+    idx = lane + i * 32
+    v = x[token, idx].float()
+    vals.append(v)
+    acc = acc + v * v
+  total = _warp_reduce(acc)
+  norm = (total / dim + eps).rsqrt()
+  stores = []
+  for i, v in enumerate(vals):
+    idx = lane + i * 32
+    normed = v * norm * weight[idx].float()
+    g = gate[token, idx].float()
+    act = g.sigmoid() if is_kda else g.silu()
+    stores.append(out[token, idx].store((normed * act).cast(out.dtype)))
+  return UOp.group(*stores).end(token, lane).sink(arg=KernelInfo(name="nv_gated_rmsnorm", opts_to_apply=()))
+
+
+def nv_gated_rmsnorm(x:Tensor, gate:Tensor, weight:Tensor, eps:float=1e-6, is_kda:bool=False, out_dtype=dtypes.half) -> Tensor:
+  """Fused RMSNorm + Gate (silu or sigmoid) projection: computes (rmsnorm(x) * weight * act(gate)).cast(out_dtype)."""
+  D = x.shape[-1]
+  if not nv_custom_kernels_supported(x.device) or weight is None or isinstance(D, UOp) or D % 32 != 0:
+    act = gate.sigmoid() if is_kda else gate.silu()
+    return (nv_rmsnorm(x, weight, eps) * act).cast(out_dtype)
+  orig_shape = x.shape
+  x_flat = x.reshape(-1, D)
+  g_flat = gate.reshape(-1, D)
+  tokens = x_flat.shape[0]
+  out = Tensor.empty(tokens, D, dtype=out_dtype, device=x.device)
+  res = Tensor.custom_kernel(out, x_flat, g_flat, weight,
+                             fxn=functools.partial(_gated_rmsnorm_kernel, tokens=tokens, dim=D, eps=eps, is_kda=is_kda))[0]
+  return res.reshape(orig_shape)
+
 
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str="nv_linear_q8_0") -> UOp:
@@ -182,7 +223,19 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
     val = group_dot(token, output, group) if group_count % 32 == 0 else       (group < group_count).where(group_dot(token, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
     acc = acc + val
   total = _warp_reduce(acc)
-  return out[token, output, lane].store(total.cast(out.dtype)).end(token_output, lane).sink(
+  if len(out.shape) == 2:
+    # Every lane must finish the collective before lane zero stores the result.
+    reduced = UOp.placeholder((1,), dtypes.float32, slot=0, addrspace=AddrSpace.REG)
+    total = reduced.after(reduced.store(total))[0].load()
+    return out[token, output.valid(lane.eq(0))].store(total.cast(out.dtype)).end(token_output, lane).sink(
+      arg=KernelInfo(name=name, opts_to_apply=()))
+  index = lane
+  if out.shape[-1] == 1:
+    # Every lane must finish the collective before lane zero stores the compact result.
+    reduced = UOp.placeholder((1,), dtypes.float32, slot=0, addrspace=AddrSpace.REG)
+    total = reduced.after(reduced.store(total))[0].load()
+    index = lane.valid(lane.eq(0))
+  return out[token, output, index].store(total.cast(out.dtype)).end(token_output, lane).sink(
     arg=KernelInfo(name=name, opts_to_apply=()))
 
 
@@ -192,11 +245,50 @@ def _q8_0_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_f
   def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
     xwords = _load_lanes(xq[token, group, 0], 8)
     base = (output*group_count+group)*Q8_U16_WORDS
-    dot = UOp.const(0, dtypes.int32)
-    for word_idx in range(8):
-      word = _nv_ldcs16(raw[base+1+word_idx*2]) | (_nv_ldcs16(raw[base+2+word_idx*2]).cast(dtypes.uint32) << 16)
-      dot = _nv_dp4a(word, xwords[word_idx], dot)
-    return dot.float() * xd[token, group, 0] * _half(_nv_ldcs16(raw[base]))
+    arg_str = """([&](){{
+      const unsigned short *w = (const unsigned short*)({0});
+      unsigned short s1 = __ldcs(w + 1);
+      unsigned short s2 = __ldcs(w + 2);
+      unsigned short s3 = __ldcs(w + 3);
+      unsigned short s4 = __ldcs(w + 4);
+      unsigned short s5 = __ldcs(w + 5);
+      unsigned short s6 = __ldcs(w + 6);
+      unsigned short s7 = __ldcs(w + 7);
+      unsigned short s8 = __ldcs(w + 8);
+      unsigned short s9 = __ldcs(w + 9);
+      unsigned short s10 = __ldcs(w + 10);
+      unsigned short s11 = __ldcs(w + 11);
+      unsigned short s12 = __ldcs(w + 12);
+      unsigned short s13 = __ldcs(w + 13);
+      unsigned short s14 = __ldcs(w + 14);
+      unsigned short s15 = __ldcs(w + 15);
+      unsigned short s16 = __ldcs(w + 16);
+
+      int w0 = (int)((unsigned int)s1 | ((unsigned int)s2 << 16));
+      int w1 = (int)((unsigned int)s3 | ((unsigned int)s4 << 16));
+      int w2 = (int)((unsigned int)s5 | ((unsigned int)s6 << 16));
+      int w3 = (int)((unsigned int)s7 | ((unsigned int)s8 << 16));
+      int w4 = (int)((unsigned int)s9 | ((unsigned int)s10 << 16));
+      int w5 = (int)((unsigned int)s11 | ((unsigned int)s12 << 16));
+      int w6 = (int)((unsigned int)s13 | ((unsigned int)s14 << 16));
+      int w7 = (int)((unsigned int)s15 | ((unsigned int)s16 << 16));
+
+      int a0 = __dp4a(w0, (int){1}, 0);
+      int a1 = __dp4a(w1, (int){2}, 0);
+      int a2 = __dp4a(w2, (int){3}, 0);
+      int a3 = __dp4a(w3, (int){4}, 0);
+      a0 = __dp4a(w4, (int){5}, a0);
+      a1 = __dp4a(w5, (int){6}, a1);
+      a2 = __dp4a(w6, (int){7}, a2);
+      a3 = __dp4a(w7, (int){8}, a3);
+
+      return (a0 + a1) + (a2 + a3);
+    }})()"""
+    srcs = (raw[base], xwords[0], xwords[1], xwords[2], xwords[3], xwords[4], xwords[5], xwords[6], xwords[7])
+    dot = UOp(Ops.CUSTOMI, dtypes.int32, srcs, arg=arg_str)
+    scale = _half(_nv_ldcs16(raw[base]))
+    return dot.float() * xd[token, group, 0] * scale
+
   return _decode_linear(out, out_features, group_count, group_dot)
 
 
@@ -205,47 +297,56 @@ def q8_0_linear(layer:Any, x:Tensor) -> Tensor:
   tokens = int(x.numel()) // layer.in_features
   raw, out_features, in_features = layer.weight.uop.buf_uop, layer.out_features, layer.in_features
   xq, xd = _q8_quantize(x, tokens, in_features)
-  out = Tensor.empty(tokens, out_features, 32, dtype=dtypes.float32, device=x.device).uop
+  out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
   all_srcs = (out, raw, xq.uop, xd.uop)
   params = tuple(UOp.placeholder_like(src, slot=i) for i,src in enumerate(all_srcs))
   kernel = _q8_0_decode_kernel(*params, out_features=out_features, in_features=in_features).call(*all_srcs)
-  result = Tensor(out.after(kernel))[..., 0]
+  result = Tensor(out.after(kernel))
   result = result.reshape(*x.shape[:-1], out_features)
   return result if layer.bias is None else result + layer.bias
 
 
 @functools.cache
-def _l2norm_kernel(out:UOp, x:UOp, tokens:int, dim:int, eps:float) -> UOp:
+def _l2norm_kernel(out:UOp, x:UOp, tokens:int, dim:int, eps:float, scale:float=1.0, repeat:int=1) -> UOp:
   token = UOp.range(tokens, 0, AxisType.GLOBAL)
   lane = UOp.range(32, 1, AxisType.LOCAL)
   elems = dim // 32
+  vals = []
   acc = UOp.const(0, dtypes.float32)
   for i in range(elems):
     idx = lane + i * 32
     v = x[token, idx].float()
+    vals.append(v)
     acc = acc + v * v
   total = _warp_reduce(acc)
-  # L2 norm: x / max(sqrt(sum(x²)), eps)  =>  x * (1 / max(sqrt(total), eps))
   norm = total.sqrt().maximum(eps).reciprocal()
+  if scale != 1.0: norm = norm * UOp.const(scale, dtypes.float32)
   stores = []
-  for i in range(elems):
+  for i, v in enumerate(vals):
     idx = lane + i * 32
-    v = x[token, idx].float()
-    stores.append(out[token, idx].store((v * norm).cast(out.dtype)))
+    res_val = (v * norm).cast(out.dtype)
+    if repeat == 1:
+      stores.append(out[token, idx].store(res_val))
+    else:
+      for r in range(repeat):
+        stores.append(out[r, token, idx].store(res_val))
   return UOp.group(*stores).end(token, lane).sink(arg=KernelInfo(name="nv_normalize", opts_to_apply=()))
 
 
-def nv_normalize(x:Tensor, eps:float=1e-6) -> Tensor:
-  """Fused warp-level L2 normalization: x / max(||x||_2, eps)."""
+def nv_normalize(x:Tensor, eps:float=1e-6, scale:float=1.0, repeat:int=1) -> Tensor:
+  """Fused warp-level L2 normalization: x / max(||x||_2, eps) * scale with optional head repeat."""
   D = x.shape[-1]
   if not nv_custom_kernels_supported(x.device) or isinstance(D, UOp) or D % 32 != 0:
-    return x.normalize(dim=-1, eps=eps)
-  orig_shape = x.shape
+    res = x.normalize(dim=-1, eps=eps)
+    if scale != 1.0: res = res * scale
+    return res if repeat == 1 else res.repeat(*((1,)*(len(x.shape)-2)), repeat, 1)
+  orig_shape = (*x.shape[:-2], x.shape[-2] * repeat, D) if repeat > 1 else x.shape
   x_flat = x.reshape(-1, D)
   tokens = x_flat.shape[0]
-  out = Tensor.empty(tokens, D, dtype=x.dtype, device=x.device)
-  res = Tensor.custom_kernel(out, x_flat.contiguous(),
-                             fxn=functools.partial(_l2norm_kernel, tokens=tokens, dim=D, eps=eps))[0]
+  out_shape = (repeat, tokens, D) if repeat > 1 else (tokens, D)
+  out = Tensor.empty(*out_shape, dtype=x.dtype, device=x.device)
+  res = Tensor.custom_kernel(out, x_flat,
+                             fxn=functools.partial(_l2norm_kernel, tokens=tokens, dim=D, eps=eps, scale=scale, repeat=repeat))[0]
   return res.reshape(orig_shape)
 
 

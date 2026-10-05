@@ -3,7 +3,7 @@ import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_rmsnorm, nv_add_rmsnorm, nv_normalize, nv_argmax
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported, nv_rmsnorm, nv_add_rmsnorm, nv_gated_rmsnorm, nv_normalize, nv_argmax
 from tinygrad.llm.gguf import gguf_load
 
 class RMSNorm(nn.RMSNorm):
@@ -150,15 +150,20 @@ class FFNBlock:
   def _init_state(self, x:Tensor): raise NotImplementedError
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor: raise NotImplementedError
 
+  def forward_with_residual(self, h: Tensor, res: Tensor|None, start_pos: int|UOp) -> tuple[Tensor, Tensor]:
+    self._init_state(h)
+    if res is None:
+      attn_normed = self.attn_norm(h)
+    else:
+      h, attn_normed = nv_add_rmsnorm(h, res, self.attn_norm.weight, self.attn_norm.eps)
+    attn_out = self._attention(attn_normed, start_pos)
+    h, ffn_normed = nv_add_rmsnorm(h, attn_out, self.ffn_norm.weight, self.ffn_norm.eps)
+    res = self._feed_forward(ffn_normed)
+    return h, res
+
   def __call__(self, x: Tensor, start_pos: int|UOp):
-    self._init_state(x)
-    # we pass in the weights implicitly so we unpack the GGUF on the fly
-    @function(precompile=True, allow_implicit=True)
-    def _run(x:Tensor, start_pos:int|UOp):
-      attn_out = self._attention(self.attn_norm(x), start_pos)
-      h, h_normed = nv_add_rmsnorm(x, attn_out, self.ffn_norm.weight, self.ffn_norm.eps)
-      return (h + self._feed_forward(h_normed)).contiguous()
-    return _run(x, start_pos)
+    h, res = self.forward_with_residual(x, None, start_pos)
+    return (h + res).contiguous()
 
 Q8_GROUP_SIZE = 32
 
@@ -337,35 +342,47 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # qkv conv, conv_state is reset when starting from position 0
     conv_state = initial.where(0, self.conv_state)
-    # assemble the conv window in a static-size buffer: [conv_state | qkv rows | zero-pad].
-    # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
-    win = Tensor.zeros(B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels).uop
-    win = win.after(win[:, :self.ssm_conv_kernel-1].store(conv_state.cast(win.dtype).uop))
-    win = win.after(win[:, self.ssm_conv_kernel-1:self.ssm_conv_kernel-1+T].store(self.attn_qkv(x).cast(win.dtype).uop))
-    conv_window = Tensor(win)
-    # the last conv_kernel-1 columns of the window become the next conv state
-    conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop)
+    if resolve(T == 1):
+      qkv = self.attn_qkv(x)
+      c0, c1, c2 = conv_state[:, 0:1], conv_state[:, 1:2], conv_state[:, 2:3]
+      w = self.ssm_conv1d["weight"]
+      conv_out = (c0 * w[:, 0] + c1 * w[:, 1] + c2 * w[:, 2] + qkv * w[:, 3]).silu()
+      conv_state_store = self.conv_state.uop.store(Tensor.cat(c1, c2, qkv, dim=1).cast(self.conv_state.dtype).uop)
+    else:
+      # assemble the conv window in a static-size buffer: [conv_state | qkv rows | zero-pad].
+      # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
+      win = Tensor.zeros(B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels).uop
+      win = win.after(win[:, :self.ssm_conv_kernel-1].store(conv_state.cast(win.dtype).uop))
+      win = win.after(win[:, self.ssm_conv_kernel-1:self.ssm_conv_kernel-1+T].store(self.attn_qkv(x).cast(win.dtype).uop))
+      conv_window = Tensor(win)
+      # the last conv_kernel-1 columns of the window become the next conv state
+      conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop)
 
-    conv_out = functools.reduce(lambda a,b: a+b,
-      (conv_window[:, i:i+T_pad] * self.ssm_conv1d["weight"][:, i] for i in range(self.ssm_conv_kernel))).silu()
+      conv_out = functools.reduce(lambda a,b: a+b,
+        (conv_window[:, i:i+T_pad] * self.ssm_conv1d["weight"][:, i] for i in range(self.ssm_conv_kernel))).silu()
     if symbolic:
       out_gate = out_gate.pad_to((B, T_pad, self.num_v_heads, self.head_v_dim))
       beta, log_alpha = beta.pad_to((B, T_pad, self.num_v_heads)), log_alpha.pad_to((B, T_pad, *log_alpha.shape[2:]))
     q, k, v = conv_out.split([self.q_dim, self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
     qk_eps = 1e-12 if is_kda else 1e-6
-    q, k = (nv_normalize(z.reshape(B, T_pad, self.num_k_heads, self.head_k_dim), eps=qk_eps)
-            .repeat(1, 1, self.num_v_heads//self.num_k_heads, 1) for z in (q, k))
+    if resolve(T == 1):
+      q = nv_normalize(q.reshape(B, T_pad, self.num_k_heads, self.head_k_dim), eps=qk_eps, scale=self.head_k_dim**-0.5, repeat=self.num_v_heads//self.num_k_heads)
+      k = nv_normalize(k.reshape(B, T_pad, self.num_k_heads, self.head_k_dim), eps=qk_eps, repeat=self.num_v_heads//self.num_k_heads)
+    else:
+      q = nv_normalize(q.reshape(B, T_pad, self.num_k_heads, self.head_k_dim), eps=qk_eps, scale=self.head_k_dim**-0.5).repeat(1, 1, self.num_v_heads//self.num_k_heads, 1)
+      k = nv_normalize(k.reshape(B, T_pad, self.num_k_heads, self.head_k_dim), eps=qk_eps).repeat(1, 1, self.num_v_heads//self.num_k_heads, 1)
     v = v.reshape(B, T_pad, self.num_v_heads, self.head_v_dim)
     # layout the per-step operands to broadcast against the (B, H, V, K) state
     q, k, v, beta = (z.transpose(1, 2).float() for z in (q, k, v, beta))
-    q = q * self.head_k_dim**-0.5
     alpha = log_alpha.transpose(1, 2).exp()  # per-channel decay for kda, per-head otherwise (B, H, T, V|1)
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
     state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
     if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and (amd_custom_kernels_supported(x.device) or nv_custom_kernels_supported(x.device)):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3)
-      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
+      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos))
+      if not (nv_custom_kernels_supported(x.device) and resolve(T == 1)):
+        core = core.transpose(1, 2)
     else:
       q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
       alpha = alpha.unsqueeze(-1)
@@ -382,7 +399,13 @@ class GatedDeltaNetBlock(FFNBlock):
       core = Tensor(outs[0].stack(*outs[1:], dim=1).contiguous().uop.after(state_store))
 
     # output; undo the padding before the output projection
-    z = (self.ssm_norm(core) * (out_gate.sigmoid() if is_kda else out_gate.silu())).cast(x.dtype).contiguous()
+    if nv_custom_kernels_supported(x.device) and self.ssm_norm.weight is not None and not isinstance(self.head_v_dim, UOp) and self.head_v_dim % 32 == 0:
+      if resolve(T == 1):
+        z = nv_gated_rmsnorm(core.reshape(-1, self.head_v_dim), out_gate.reshape(-1, self.head_v_dim), self.ssm_norm.weight, self.ssm_norm.eps, is_kda=is_kda, out_dtype=x.dtype).reshape(B, T, -1)
+      else:
+        z = nv_gated_rmsnorm(core, out_gate, self.ssm_norm.weight, self.ssm_norm.eps, is_kda=is_kda, out_dtype=x.dtype)
+    else:
+      z = (self.ssm_norm(core) * (out_gate.sigmoid() if is_kda else out_gate.silu())).cast(x.dtype).contiguous()
     if symbolic: z = z[:, :T]
     return self.ssm_out(z.reshape(B, T, -1))
 
@@ -410,10 +433,17 @@ class Transformer:
     self.rollout_jit = TinyJit(self.forward)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    x = self.token_embd(tokens).float()                   # (B, T, D)
-    for block in self.blk: x = block(x, start_pos)
+    h = self.token_embd(tokens).float()                   # (B, T, D)
+    res = None
+    for block in self.blk: h, res = block.forward_with_residual(h, res, start_pos)
+    if res is not None and nv_custom_kernels_supported(h.device) and self.output_norm.weight is not None:
+      h, normed = nv_add_rmsnorm(h, res, self.output_norm.weight, self.output_norm.eps)
+    else:
+      normed = self.output_norm(h if res is None else h + res)
     # only run the output projection on the last token
-    logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
+    logits = self.output(normed[:, -1:])[:, -1, :]
+    if getattr(temperature, "val", None) == 0.0:
+      return nv_argmax(logits, keepdim=True)
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return nv_argmax(logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log(), keepdim=True)
 
@@ -522,6 +552,21 @@ class Transformer:
       _stamp(model.token_embd, 'token_embd')
       _stamp(model.output, 'output')
       for i, b in enumerate(model.blk): _stamp(b, f'blk.{i}')  # NOTE: rope_freqs.weight (32,) is unused
+    # Pre-realize non-quantized weights (RMSNorm, short conv, biases) so they don't unpack on every decode step
+    non_quant_params = []
+    for blk in model.blk:
+      for k, v in vars(blk).items():
+        if isinstance(v, dict):
+          for vk, vv in v.items():
+            if isinstance(vv, Tensor) and not getattr(vv, 'ggml_type', None): non_quant_params.append(vv)
+        elif hasattr(v, 'weight') and isinstance(v.weight, Tensor) and not getattr(v, 'ggml_type', None):
+          non_quant_params.append(v.weight)
+        elif isinstance(v, Tensor) and not getattr(v, 'ggml_type', None):
+          non_quant_params.append(v)
+    if hasattr(model.output_norm, 'weight'): non_quant_params.append(model.output_norm.weight)
+    if hasattr(model.token_embd, 'weight'): non_quant_params.append(model.token_embd.weight)
+    for p in non_quant_params: p.replace(p.contiguous())
+    Tensor.realize(*non_quant_params)
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
@@ -545,19 +590,22 @@ class Transformer:
     v_toks_rollout = UOp.variable("toks", 1, 1)
     # TODO: use UOp.variable for temperature once float variables are supported
     temp = Tensor([temperature])
+    temp.val = temperature
     # assign all input tokens once, then slice from start_pos for the model call
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
     out, prompt_len = None, len(tokens)
-    while len(tokens) < self.max_context:
-      n_toks = min(chunk_size, len(tokens) - start_pos)
-      v_toks = v_toks_rollout if n_toks == 1 else v_toks_prefill
-      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
-      start_pos += n_toks
-      # chunked prefill: keep processing until all prompt tokens are consumed
-      if start_pos < len(tokens): continue
-      tokens.append(int(out.item()))
+    try:
+      while len(tokens) < self.max_context:
+        n_toks = min(chunk_size, len(tokens) - start_pos)
+        v_toks = v_toks_rollout if n_toks == 1 else v_toks_prefill
+        sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
+        out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+        start_pos += n_toks
+        # chunked prefill: keep processing until all prompt tokens are consumed
+        if start_pos < len(tokens): continue
+        tokens.append(int(out.item()))
+        yield tokens[-1]
+    finally:
       self._cached_tokens = tokens[:-1]
-      yield tokens[-1]

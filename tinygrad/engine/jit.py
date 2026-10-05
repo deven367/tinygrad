@@ -182,7 +182,7 @@ class CapturedJit(Generic[ReturnType]):
     return out
 
   def __call__(self, input_uops:list[UOp], var_vals:dict[str, int]) -> ReturnType:
-    concrete = tuple(_copy_input(u) if u in self._written_uops else u for u in input_uops)
+    concrete = tuple(_copy_input(u) if (u in self._written_uops and getenv("JIT_COPY_INPUTS", 0)) else u for u in input_uops)
     if DEBUG >= 1 and len(self.linear.src) >= 10: print(f"jit execs {len(self.linear.src)} calls")
     run_linear(self.linear, var_vals, input_uops=concrete, jit=True)
     return self.ret

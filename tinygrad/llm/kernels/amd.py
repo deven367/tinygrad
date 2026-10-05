@@ -95,7 +95,8 @@ class Linear(nn.Linear):
     if self.ggml_type == Q8_0 and nv_supported:
       if isinstance(x.numel(), int): return q8_0_linear(self, x)
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
-      out = q8_0_linear(self, x.pad_to(x.max_shape))
+      if not hasattr(x, "_padded"): x._padded = x.pad_to(x.max_shape)
+      out = q8_0_linear(self, x._padded)
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     if self.ggml_type == Q4_K and nv_supported:
       if isinstance(x.numel(), int): return q4_k_linear(self, x)
@@ -501,26 +502,28 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
 # ******** gated delta net: fused recurrent scan ********
 
 @functools.cache
-def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None, nv:bool=False) -> UOp:
+def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, start_pos:UOp|None=None, nv:bool=False) -> UOp:
   batch, heads, tokens, value_dim, row_tile = *core.shape, 4
   key_dim, alpha_dim = q.shape[-1], alpha.shape[-1] if len(alpha.shape) == 4 else 1
   assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % 32 == 0 and value_dim % row_tile == 0
   batch, heads, tokens, value_dim, key_dim = cast(tuple[int, int, int, int, int], (batch, heads, tokens, value_dim, key_dim))
   core, v = (x.reshape(batch*heads, tokens, value_dim) for x in (core, v))
   q, k = (x.reshape(batch*heads, tokens, key_dim) for x in (q, k))
-  beta, kq = (x.reshape(batch*heads, tokens) for x in (beta, kq))
+  beta = beta.reshape(batch*heads, tokens)
   alpha, state = alpha.reshape(batch*heads, tokens, alpha_dim), state.reshape(batch*heads, value_dim, key_dim)
   bh_row, lane = UOp.range(batch*heads*value_dim//row_tile, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
   bh, row_base = bh_row // (value_dim//row_tile), (bh_row % (value_dim//row_tile))*row_tile
   rows, cols = tuple(row_base+i for i in range(row_tile)), tuple(lane + i*32 for i in range(key_dim//32))
   current = UOp.placeholder((row_tile*key_dim//32,), dtypes.float32, slot=0, addrspace=AddrSpace.REG)
-  initial = None if start_pos is None else start_pos.eq(0)
+  initial = None if start_pos is None else start_pos[0].load().eq(0)
   current = current.after(current.store(UOp.stack(*(state[bh, row, col].float() if initial is None else
     initial.where(0, state[bh, row, col].float()) for row in rows for col in cols))))
   token = UOp.range(tokens, 2, AxisType.REDUCE)
   keys = tuple(k[bh, token, col].load() for col in cols)
   queries = tuple(q[bh, token, col].load() for col in cols)
-  updates, stores = [], []
+  kq_val = warp_reduce(sum((x*y for x,y in zip(queries, keys)), UOp.const(0, dtypes.float32)), full_wave=True, nv=nv)
+  updates, outputs = [], []
+  output = UOp.placeholder((row_tile,), dtypes.float32, slot=1, addrspace=AddrSpace.REG)
   for row_idx,row in enumerate(rows):
     previous = tuple(current.after(token)[row_idx*key_dim//32+i].load() for i in range(key_dim//32))
     av, bv = alpha[bh, token, row if alpha_dim > 1 else 0].load(), beta[bh, token].load()
@@ -528,7 +531,10 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
     state_q = warp_reduce(sum((x*y for x,y in zip(previous, queries)), UOp.const(0, dtypes.float32)), full_wave=True, nv=nv)
     delta = (v[bh, token, row].load() - state_k*av) * bv
     updates += [x*av + delta*y for x,y in zip(previous, keys)]
-    stores.append(core[bh, token, row.valid(lane.eq(0))].store(state_q*av + delta*kq[bh, token]))
+    outputs.append(state_q*av + delta*kq_val)
+  # Materialize every shuffle before the lane-zero store: all 32 lanes must participate.
+  output_store = output.store(UOp.stack(*outputs))
+  stores = [core[bh, token, row.valid(lane.eq(0))].store(output.after(output_store)[i].load()) for i,row in enumerate(rows)]
   step = UOp.group(*stores, current.store(UOp.stack(*updates))).end(token)
   state_stores = (state[bh, row, col].store(current.after(step)[row_idx*key_dim//32+i].load().cast(state.dtype))
                   for row_idx,row in enumerate(rows) for i,col in enumerate(cols))
@@ -542,17 +548,8 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape == (batch, heads, value_dim, key_dim)
   assert alpha.shape[:3] == (batch, heads, tokens) and (len(alpha.shape) == 3 or alpha.shape[-1] in (1, value_dim))
   assert key_dim % 32 == 0 and value_dim % 4 == 0
-  core, kq = Tensor.empty_like(v), (q*k).sum(-1).contiguous()
-  srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
-  if start_pos is None: return Tensor.custom_kernel(*srcs, fxn=functools.partial(_gated_delta_prefill_kernel, nv=nv_device))[0]
-  # resolve start_pos at capture time: the JIT captures separate graphs for prefill
-  # (start_pos=0, reset state) and rollout (start_pos>0, keep state). kernel_var
-  # binding doesn't propagate on CUDA, so we branch here instead.
-  from tinygrad.uop.ops import resolve
-  _, sp_val = start_pos.uop.unbind()
-  if resolve(sp_val == 0):
-    # prefill: always reset state (start_pos=0 → initial=True)
-    return Tensor.custom_kernel(*srcs, fxn=functools.partial(_gated_delta_prefill_kernel, start_pos=None, nv=nv_device))[0]
-  else:
-    # rollout: never reset (start_pos>0 → initial=False)
-    return Tensor.custom_kernel(*srcs, fxn=functools.partial(_gated_delta_prefill_kernel, start_pos=UOp.const(1, dtypes.int32), nv=nv_device))[0]
+  core = Tensor.empty_like(v)
+  srcs:tuple[Tensor, ...] = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state)
+  # A buffer keeps the reset flag dynamic when a captured decode graph restarts at position zero.
+  if start_pos is not None: srcs = (*srcs, start_pos.cast(dtypes.int32).reshape(1).contiguous())
+  return Tensor.custom_kernel(*srcs, fxn=functools.partial(_gated_delta_prefill_kernel, nv=nv_device))[0]

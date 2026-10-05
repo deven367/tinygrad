@@ -1,12 +1,13 @@
 import unittest
 import numpy as np
-from tinygrad import Tensor, dtypes, nn
+from tinygrad import Tensor, UOp, TinyJit, dtypes, nn
 from tinygrad.llm.model import (
   GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig,
   apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk,
 )
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, amd_custom_kernels_supported
 from tinygrad.llm.gguf import ggml_data_to_tensor
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported
 
 def apply_rope(x:Tensor, start_pos:int):
   B, H, T, Hd = x.shape
@@ -53,7 +54,8 @@ class TestAttention(unittest.TestCase):
 
 class TestGatedDeltaNetBlock(unittest.TestCase):
   def test_gated_delta_rectangular_state_and_row_decay(self):
-    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
+    device = Tensor.empty(1).device
+    if not (amd_custom_kernels_supported(device) or nv_custom_kernels_supported(device)): self.skipTest("RDNA3 or NVIDIA required")
     rng = np.random.default_rng(42)
     q, k = (rng.normal(size=(1, 1, 3, 32)).astype(np.float32) for _ in range(2))
     v, beta = rng.normal(size=(1, 1, 3, 4)).astype(np.float32), rng.uniform(size=(1, 1, 3)).astype(np.float32)
@@ -68,6 +70,24 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     out = gated_delta_prefill(Tensor(q), Tensor(k), Tensor(v), Tensor(beta), Tensor(alpha), state).realize()
     np.testing.assert_allclose(out.numpy(), expected_out, rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(state.numpy(), expected_state, rtol=1e-4, atol=1e-4)
+
+  def test_gated_delta_jit_restart(self):
+    device = Tensor.empty(1).device
+    if not (amd_custom_kernels_supported(device) or nv_custom_kernels_supported(device)): self.skipTest("RDNA3 or NVIDIA required")
+    q, k = (Tensor.full((1, 1, 1, 32), 0.125).realize() for _ in range(2))
+    v, beta, alpha = Tensor.ones(1, 1, 1, 4).realize(), Tensor.full((1, 1, 1), 0.5).realize(), Tensor.full((1, 1, 1, 1), 0.9).realize()
+    state = Tensor.ones(1, 1, 4, 32).clone().realize()
+    expected = np.ones((1, 1, 4, 32), dtype=np.float32)
+    @TinyJit
+    def run(pos): return gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(pos)).realize()
+    for pos in (1, 2, 3, 0, 1):
+      if pos == 0: expected.fill(0)
+      expected *= 0.9
+      delta = (1 - (expected*0.125).sum(-1, keepdims=True))*0.5
+      expected += delta*0.125
+      out = run(UOp.variable("start_pos", 0, 4).bind(pos))
+      np.testing.assert_allclose(out.numpy(), (expected*0.125).sum(-1)[:, :, None], rtol=1e-5, atol=1e-5)
+      np.testing.assert_allclose(state.numpy(), expected, rtol=1e-5, atol=1e-5)
 
   def _tensor_linspace(self, start:float, stop:float, shape:tuple[int, ...]) -> Tensor:
     return Tensor.linspace(start, stop, int(np.prod(shape)), dtype=dtypes.float32).reshape(*shape)
